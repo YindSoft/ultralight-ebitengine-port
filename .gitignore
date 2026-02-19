@@ -1,0 +1,19 @@
+# Build artifacts
+*.exe
+*.dll
+*.dat
+*.log
+*.7z
+*.bat
+
+# Ultralight SDK (download separately, see README)
+# Keep the bridge C source but not the compiled DLL
+
+# IDE / debug
+__debug_bin*
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: linear-gradient(180deg, rgba(40, 20, 60, 0.95), rgba(20, 10, 40, 0.95));
+    color: #e0e0e0;
+    padding: 12px;
+    user-select: none;
+    height: 100%;
+  }
+  h1 {
+    color: #ce93d8;
+    font-size: 18px;
+    margin-bottom: 12px;
+    text-align: center;
+  }
+  .box {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(206, 147, 216, 0.4);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+  .box h2 {
+    color: #b39ddb;
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+  button {
+    width: 100%;
+    background: rgba(156, 39, 176, 0.6);
+    color: white;
+    border: 1px solid rgba(186, 104, 200, 0.8);
+    border-radius: 6px;
+    padding: 8px;
+    margin: 4px 0;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  button:hover {
+    background: rgba(186, 104, 200, 0.7);
+  }
+  input {
+    width: 100%;
+    padding: 6px 8px;
+    margin: 4px 0;
+    font-size: 12px;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 4px;
+    color: #fff;
+  }
+  #out {
+    font-size: 11px;
+    color: #b39ddb;
+    margin-top: 8px;
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+  <h1>Sidebar</h1>
+  <div class="box">
+    <h2>Second View</h2>
+    <p style="font-size: 11px; color: #aaa;">This is a separate HTML view running in its own Ultralight instance.</p>
+  </div>
+  <div class="box">
+    <h2>Send to Go</h2>
+    <input type="text" id="msg" placeholder="Message..." />
+    <button onclick="send()">Send</button>
+  </div>
+  <div id="out"></div>
+<script>
+  function send() {
+    var msg = document.getElementById('msg').value || 'hello from sidebar';
+    go.send(msg);
+    document.getElementById('out').textContent = 'Sent: ' + msg;
+  }
+
+  // Receive data from Go via ui.Send(data)
+  go.receive = function(data) {
+    document.getElementById('out').textContent = 'From Go: ' + JSON.stringify(data);
+  };
+</script>
+</body>
+</html>
