@@ -7,6 +7,7 @@ Render HTML/CSS/JS interfaces as textures in [Ebitengine](https://ebitengine.org
 - Bidirectional Go <-> JavaScript communication via native JavaScriptCore bindings
 - Multiple independent views with per-view input routing
 - Mouse, scroll, and keyboard forwarding from Ebiten to Ultralight
+- Embedded assets via VFS: bundle HTML/CSS/JS/images inside the binary with `go:embed`
 - No CGo required (uses [purego](https://github.com/ebitengine/purego) + a small C bridge DLL)
 
 ## Architecture
@@ -276,23 +277,93 @@ sidebar.SetBounds(600, 0, 200, 400)
 HTML views have transparent backgrounds by default. This lets you layer HTML on top
 of your game rendering. Use CSS `background: rgba(...)` for semi-transparent panels.
 
-## Example
+## Embedded assets (VFS)
+
+You can bundle all your HTML/CSS/JS/images inside the Go binary using `go:embed` and
+the built-in virtual file system (VFS). No files need to exist on disk at runtime
+(except the Ultralight SDK libraries and `icudt67l.dat`).
+
+```go
+package main
+
+import (
+    "embed"
+    ultralightui "github.com/YindSoft/ultralight-ebitengine-port"
+    "github.com/hajimehoshi/ebiten/v2"
+)
+
+//go:embed ui
+var uiFiles embed.FS
+
+type Game struct{ ui *ultralightui.UltralightUI }
+func (g *Game) Update() error              { return g.ui.Update() }
+func (g *Game) Draw(screen *ebiten.Image)  { screen.DrawImage(g.ui.GetTexture(), nil) }
+func (g *Game) Layout(w, h int) (int, int) { return 800, 600 }
+
+func main() {
+    ui, err := ultralightui.NewFromFS(800, 600, "ui/index.html", uiFiles, nil)
+    if err != nil { panic(err) }
+    defer ui.Close()
+
+    ebiten.SetWindowSize(800, 600)
+    ebiten.RunGame(&Game{ui: ui})
+}
+```
+
+### How it works
+
+1. `go:embed ui` compiles the entire `ui/` folder into the binary
+2. `NewFromFS` walks the embedded FS and registers every file in a C-level VFS via `RegisterFile()`
+3. The VFS is checked first on every Ultralight file request; disk is used as fallback
+4. The main page is loaded via `file:///ui/index.html` which resolves from the VFS
+5. All relative references (`<link href="style.css">`, `<script src="app.js">`, etc.) resolve from the VFS too
+
+### VFS API
+
+You can also register individual files manually (useful for dynamic content):
+
+```go
+// Register files before creating views that reference them
+ultralightui.RegisterFile("ui/config.json", configBytes)
+
+// Query the number of registered files
+count := ultralightui.VFSFileCount()
+
+// Clear all registered files
+ultralightui.ClearFiles()
+```
+
+## Examples
+
+### Multi-view example
 
 ![screenshot](screenshot.png)
 
 See the [`example/`](example/) directory for a complete working demo with two views,
 animated Ebiten shapes behind HTML, bidirectional communication, and keyboard input.
 
-To run it:
-
 ```bash
 cd example
 go run .
 ```
 
-The example expects the SDK libraries to be in the parent directory (the repo root).
+### Embedded assets example
 
-## How it works
+See the [`example_embed/`](example_embed/) directory for a demo that loads all
+HTML/CSS/JS from `go:embed` with no files on disk. It demonstrates:
+
+- Separate `.html`, `.css`, and `.js` files all served from the VFS
+- Go -> JS communication (counter updates every second)
+- JS -> Go communication (button clicks via `go.send()`)
+
+```bash
+cd example_embed
+go run .
+```
+
+Both examples expect the SDK libraries to be in the parent directory (the repo root).
+
+## How it works (internals)
 
 1. The bridge shared library loads the Ultralight SDK at runtime via `LoadLibrary`/`GetProcAddress` (Windows) or `dlopen`/`dlsym` (Linux/macOS)
 2. A dedicated worker thread handles all Ultralight API calls (renderer, views, JS eval)

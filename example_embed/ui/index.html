@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>Embedded UI (embed.FS)</h1>
+
+  <div class="panel">
+    <h2>Counter from Go: <span id="counter">0</span></h2>
+    <p class="hint">CSS and JS loaded from embed.FS via VFS</p>
+  </div>
+
+  <div class="panel">
+    <h2>JS -> Go (go.send)</h2>
+    <button onclick="go.send('greet')">Greet</button>
+    <button onclick="go.send('ping')">Ping</button>
+    <button onclick="go.send(JSON.stringify({action:'test',value:42}))">Send JSON</button>
+  </div>
+
+  <div class="panel">
+    <h2>Message Log</h2>
+    <div id="log"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

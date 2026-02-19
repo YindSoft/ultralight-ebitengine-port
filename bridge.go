@@ -65,6 +65,9 @@ var (
 	ulViewGetMessage        func(viewID int32, buf uintptr, bufSize int32) int32
 	ulViewGetConsoleMessage func(viewID int32, buf uintptr, bufSize int32) int32
 	ulDestroy               func()
+	ulVfsRegister           func(path string, data uintptr, size int64) int32
+	ulVfsClear              func()
+	ulVfsCount              func() int32
 )
 
 var (
@@ -113,8 +116,8 @@ func unregisterView() {
 	viewCountMu.Unlock()
 }
 
-// resolveAllSymbols registra todos los simbolos exportados del bridge usando
-// getSymbolAddr (definida en bridge_windows.go o bridge_unix.go).
+// resolveAllSymbols registers all exported symbols from the bridge using
+// getSymbolAddr (defined in bridge_windows.go or bridge_unix.go).
 func resolveAllSymbols(handle uintptr) error {
 	for _, reg := range []struct {
 		fptr interface{}
@@ -138,6 +141,9 @@ func resolveAllSymbols(handle uintptr) error {
 		{&ulViewGetMessage, "ul_view_get_message"},
 		{&ulViewGetConsoleMessage, "ul_view_get_console_message"},
 		{&ulDestroy, "ul_destroy"},
+		{&ulVfsRegister, "ul_vfs_register"},
+		{&ulVfsClear, "ul_vfs_clear"},
+		{&ulVfsCount, "ul_vfs_count"},
 	} {
 		sym, err := getSymbolAddr(handle, reg.name)
 		if err != nil {

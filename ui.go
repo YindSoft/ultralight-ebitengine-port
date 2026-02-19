@@ -290,16 +290,23 @@ func (ui *UltralightUI) forwardInput() {
 }
 
 func (ui *UltralightUI) forwardKeyboard() {
+	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X/A)
 	for _, key := range inpututil.AppendJustPressedKeys(nil) {
 		vk, mods := keyToVK(key)
-		ulViewFireKey(ui.viewID, keyEventKeyDown, vk, mods, "")
-		if r := keyToRune(key); r != 0 {
-			ulViewFireKey(ui.viewID, keyEventChar, 0, mods, string(r))
+		if vk != 0 {
+			ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, "")
 		}
 	}
+	// Character input from OS text input system (handles shift, layout, IME correctly)
+	for _, r := range ebiten.AppendInputChars(nil) {
+		ulViewFireKey(ui.viewID, keyEventChar, 0, 0, string(r))
+	}
+	// Key up events
 	for _, key := range inpututil.AppendJustReleasedKeys(nil) {
 		vk, mods := keyToVK(key)
-		ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, "")
+		if vk != 0 {
+			ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, "")
+		}
 	}
 }
 
@@ -314,29 +321,16 @@ func keyToVK(key ebiten.Key) (int32, uint32) {
 	if ebiten.IsKeyPressed(ebiten.KeyAlt) {
 		mods |= keyModAlt
 	}
+	if ebiten.IsKeyPressed(ebiten.KeyMeta) {
+		mods |= keyModMeta
+	}
 	vk := ebitenKeyToVK(key)
 	return vk, mods
 }
 
-func keyToRune(key ebiten.Key) rune {
-	switch {
-	case key >= ebiten.KeyA && key <= ebiten.KeyZ:
-		return rune('a' + (key - ebiten.KeyA))
-	case key >= ebiten.Key0 && key <= ebiten.Key9:
-		return rune('0' + (key - ebiten.Key0))
-	case key == ebiten.KeySpace:
-		return ' '
-	case key == ebiten.KeyEnter || key == ebiten.KeyNumpadEnter:
-		return '\n'
-	case key == ebiten.KeyTab:
-		return '\t'
-	default:
-		return 0
-	}
-}
-
 func ebitenKeyToVK(key ebiten.Key) int32 {
 	switch key {
+	// Editing keys
 	case ebiten.KeyBackspace:
 		return 0x08
 	case ebiten.KeyTab:
@@ -347,6 +341,20 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 		return 0x1B
 	case ebiten.KeySpace:
 		return 0x20
+	case ebiten.KeyDelete:
+		return 0x2E
+	case ebiten.KeyInsert:
+		return 0x2D
+
+	// Navigation
+	case ebiten.KeyHome:
+		return 0x24
+	case ebiten.KeyEnd:
+		return 0x23
+	case ebiten.KeyPageUp:
+		return 0x21
+	case ebiten.KeyPageDown:
+		return 0x22
 	case ebiten.KeyArrowLeft:
 		return 0x25
 	case ebiten.KeyArrowUp:
@@ -355,15 +363,100 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 		return 0x27
 	case ebiten.KeyArrowDown:
 		return 0x28
-	case ebiten.KeyShift:
+
+	// Modifier keys
+	case ebiten.KeyShift, ebiten.KeyShiftLeft, ebiten.KeyShiftRight:
 		return 0x10
-	case ebiten.KeyControl:
+	case ebiten.KeyControl, ebiten.KeyControlLeft, ebiten.KeyControlRight:
 		return 0x11
-	case ebiten.KeyAlt:
+	case ebiten.KeyAlt, ebiten.KeyAltLeft, ebiten.KeyAltRight:
 		return 0x12
+	case ebiten.KeyMeta, ebiten.KeyMetaLeft, ebiten.KeyMetaRight:
+		return 0x5B
+
+	// Lock keys
+	case ebiten.KeyCapsLock:
+		return 0x14
+	case ebiten.KeyNumLock:
+		return 0x90
+	case ebiten.KeyScrollLock:
+		return 0x91
+
+	// System keys
+	case ebiten.KeyPause:
+		return 0x13
+	case ebiten.KeyPrintScreen:
+		return 0x2C
+	case ebiten.KeyContextMenu:
+		return 0x5D
+
+	// Function keys
+	case ebiten.KeyF1:
+		return 0x70
+	case ebiten.KeyF2:
+		return 0x71
+	case ebiten.KeyF3:
+		return 0x72
+	case ebiten.KeyF4:
+		return 0x73
+	case ebiten.KeyF5:
+		return 0x74
+	case ebiten.KeyF6:
+		return 0x75
+	case ebiten.KeyF7:
+		return 0x76
+	case ebiten.KeyF8:
+		return 0x77
+	case ebiten.KeyF9:
+		return 0x78
+	case ebiten.KeyF10:
+		return 0x79
+	case ebiten.KeyF11:
+		return 0x7A
+	case ebiten.KeyF12:
+		return 0x7B
+
+	// Numpad operators
+	case ebiten.KeyNumpadMultiply:
+		return 0x6A
+	case ebiten.KeyNumpadAdd:
+		return 0x6B
+	case ebiten.KeyNumpadSubtract:
+		return 0x6D
+	case ebiten.KeyNumpadDecimal:
+		return 0x6E
+	case ebiten.KeyNumpadDivide:
+		return 0x6F
+	case ebiten.KeyNumpadEqual:
+		return 0xBB
+
+	// Punctuation / symbols (Windows VK_OEM codes)
+	case ebiten.KeySemicolon:
+		return 0xBA
+	case ebiten.KeyEqual:
+		return 0xBB
+	case ebiten.KeyComma:
+		return 0xBC
+	case ebiten.KeyMinus:
+		return 0xBD
+	case ebiten.KeyPeriod:
+		return 0xBE
+	case ebiten.KeySlash:
+		return 0xBF
+	case ebiten.KeyBackquote:
+		return 0xC0
+	case ebiten.KeyBracketLeft:
+		return 0xDB
+	case ebiten.KeyBackslash, ebiten.KeyIntlBackslash:
+		return 0xDC
+	case ebiten.KeyBracketRight:
+		return 0xDD
+	case ebiten.KeyQuote:
+		return 0xDE
+
 	default:
-		if key >= ebiten.Key0 && key <= ebiten.Key9 {
-			return 0x30 + int32(key-ebiten.Key0)
+		if key >= ebiten.KeyDigit0 && key <= ebiten.KeyDigit9 {
+			return 0x30 + int32(key-ebiten.KeyDigit0)
 		}
 		if key >= ebiten.KeyA && key <= ebiten.KeyZ {
 			return 0x41 + int32(key-ebiten.KeyA)

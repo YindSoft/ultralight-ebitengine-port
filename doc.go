@@ -40,6 +40,16 @@
 //	// Run arbitrary JavaScript:
 //	ui.Eval("updateScore(100)")
 //
+// Embedded assets (VFS):
+//
+// Use [NewFromFS] to load HTML/CSS/JS/images from an [embed.FS] or any [fs.FS].
+// Files are registered in a virtual file system so Ultralight serves them from memory,
+// without exposing assets on disk:
+//
+//	//go:embed ui
+//	var uiFiles embed.FS
+//	ui, err := ultralightui.NewFromFS(800, 600, "ui/index.html", uiFiles, nil)
+//
 // JS -> Go communication uses native JavaScriptCore bindings (no console.log hacks).
 // Go -> JS communication calls window.go.receive(data) with parsed JSON.
 //

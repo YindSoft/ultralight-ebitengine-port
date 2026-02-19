@@ -12,7 +12,7 @@
  *   macOS:   gcc -shared -fPIC -o libul_bridge.dylib bridge/ul_bridge.c -O2 -lpthread -ldl
  */
 
-/* ── Abstracciones de plataforma ─────────────────────────────────────── */
+/* ── Platform abstractions ─────────────────────────────────────── */
 #ifdef _WIN32
   #include <windows.h>
   #define EXPORT __declspec(dllexport)
@@ -28,13 +28,14 @@
   #define PATHBUF_SIZE PATH_MAX
 #endif
 
+#include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
 
-/* ── VEH/VCH exception handlers (solo Windows, 0x406D1388 = MSVC SetThreadName) ── */
+/* ── VEH/VCH exception handlers (Windows only, 0x406D1388 = MSVC SetThreadName) ── */
 #ifdef _WIN32
 static LONG CALLBACK msvc_veh_handler(PEXCEPTION_POINTERS info) {
     if (info->ExceptionRecord->ExceptionCode == 0x406D1388)
@@ -78,6 +79,7 @@ typedef size_t       (*PFN_ulStringGetLength)(ULString);
 typedef ULConfig     (*PFN_ulCreateConfig)(void);
 typedef void         (*PFN_ulDestroyConfig)(ULConfig);
 typedef void         (*PFN_ulConfigSetResourcePathPrefix)(ULConfig, ULString);
+typedef void         (*PFN_ulConfigSetCachePath)(ULConfig, ULString);
 typedef ULRenderer   (*PFN_ulCreateRenderer)(ULConfig);
 typedef void         (*PFN_ulDestroyRenderer)(ULRenderer);
 typedef void         (*PFN_ulUpdate)(ULRenderer);
@@ -117,6 +119,38 @@ typedef void (*PFN_ulEnablePlatformFontLoader)(void);
 typedef void (*PFN_ulEnablePlatformFileSystem)(ULString);
 typedef void (*PFN_ulEnableDefaultLogger)(ULString);
 
+/* ULBuffer (Ultralight 1.4 opaque buffer) */
+typedef void* ULBuffer;
+typedef void (*ulDestroyBufferCallback)(void* user_data, void* data);
+typedef ULBuffer (*PFN_ulCreateBuffer)(void* data, size_t size, void* user_data, ulDestroyBufferCallback cb);
+typedef ULBuffer (*PFN_ulCreateBufferFromCopy)(const void* data, size_t size);
+typedef void     (*PFN_ulDestroyBuffer)(ULBuffer);
+
+/* ULFileSystem: custom file system callbacks (Ultralight 1.4 API) */
+typedef bool      (*PFN_FS_FileExists)(ULString);
+typedef ULString  (*PFN_FS_GetFileMimeType)(ULString);
+typedef ULString  (*PFN_FS_GetFileCharset)(ULString);
+typedef ULBuffer  (*PFN_FS_OpenFile)(ULString);  /* returns ULBuffer with data, NULL on failure */
+typedef struct {
+    PFN_FS_FileExists       file_exists;
+    PFN_FS_GetFileMimeType  get_file_mime_type;
+    PFN_FS_GetFileCharset   get_file_charset;
+    PFN_FS_OpenFile         open_file;
+} ULFileSystem;
+typedef void (*PFN_ulPlatformSetFileSystem)(ULFileSystem);
+
+/* ULClipboard: clipboard callbacks (Ultralight 1.4 API) */
+typedef void (*PFN_CB_Clear)(void);
+typedef void (*PFN_CB_ReadPlainText)(ULString result);
+typedef void (*PFN_CB_WritePlainText)(ULString text);
+typedef struct {
+    PFN_CB_Clear          clear;
+    PFN_CB_ReadPlainText  read_plain_text;
+    PFN_CB_WritePlainText write_plain_text;
+} ULClipboard;
+typedef void (*PFN_ulPlatformSetClipboard)(ULClipboard);
+typedef void (*PFN_ulStringAssignCString)(ULString, const char*);
+
 /* Ultralight JS context access */
 typedef void* JSContextRef;
 typedef void* JSObjectRef;
@@ -145,6 +179,7 @@ static PFN_ulStringGetLength           pfn_StringGetLength;
 static PFN_ulCreateConfig              pfn_CreateConfig;
 static PFN_ulDestroyConfig             pfn_DestroyConfig;
 static PFN_ulConfigSetResourcePathPrefix pfn_ConfigSetResourcePathPrefix;
+static PFN_ulConfigSetCachePath          pfn_ConfigSetCachePath;
 static PFN_ulCreateRenderer            pfn_CreateRenderer;
 static PFN_ulDestroyRenderer          pfn_DestroyRenderer;
 static PFN_ulUpdate                    pfn_Update;
@@ -182,6 +217,11 @@ static PFN_ulVersionString             pfn_VersionString;
 static PFN_ulEnablePlatformFontLoader  pfn_EnablePlatformFontLoader;
 static PFN_ulEnablePlatformFileSystem  pfn_EnablePlatformFileSystem;
 static PFN_ulEnableDefaultLogger       pfn_EnableDefaultLogger;
+static PFN_ulPlatformSetFileSystem     pfn_PlatformSetFileSystem;
+static PFN_ulCreateBuffer              pfn_CreateBuffer;
+static PFN_ulCreateBufferFromCopy      pfn_CreateBufferFromCopy;
+static PFN_ulPlatformSetClipboard      pfn_PlatformSetClipboard;
+static PFN_ulStringAssignCString       pfn_StringAssignCString;
 static PFN_ulViewLockJSContext         pfn_ViewLockJSContext;
 static PFN_ulViewUnlockJSContext       pfn_ViewUnlockJSContext;
 static PFN_JSContextGetGlobalObject            pfn_JSContextGetGlobalObject;
@@ -194,7 +234,7 @@ static PFN_JSObjectSetProperty                 pfn_JSObjectSetProperty;
 static PFN_JSValueIsString                     pfn_JSValueIsString;
 static PFN_JSValueToStringCopy                 pfn_JSValueToStringCopy;
 
-/* ── Constantes de colas y vistas ────────────────────────────────────── */
+/* ── Queue and view constants ────────────────────────────────────── */
 #define MAX_VIEWS 16
 #define CONSOLE_MSG_MAX    64
 #define CONSOLE_MSG_BUFLEN 2048
@@ -230,7 +270,7 @@ typedef struct {
     int       key_count;
     char      js_queue[JS_QUEUE_MAX][JS_QUEUE_BUFLEN];
     int       js_count;
-    /* Cola de mensajes nativos (JS -> Go via __goSend, no console) */
+    /* Native message queue (JS -> Go via __goSend, not console) */
     char      msg_queue[MSG_QUEUE_MAX][MSG_QUEUE_BUFLEN];
     int       msg_lens[MSG_QUEUE_MAX];
     int       msg_head;
@@ -253,7 +293,7 @@ static void blog(const char* fmt, ...) {
     fflush(g_log);
 }
 
-/* ── Handles de libreria (para resolve_functions) ────────────────────── */
+/* ── Library handles (for resolve_functions) ────────────────────── */
 #ifdef _WIN32
   static HMODULE g_hUltralight = NULL;
   static HMODULE g_hAppCore = NULL;
@@ -266,7 +306,7 @@ static void blog(const char* fmt, ...) {
   static void* g_hUltralightCore = NULL;
 #endif
 
-/* ── Comandos del worker thread ──────────────────────────────────────── */
+/* ── Worker thread commands ──────────────────────────────────────── */
 enum CmdType {
     CMD_NONE = 0,
     CMD_INIT,
@@ -278,7 +318,7 @@ enum CmdType {
     CMD_QUIT
 };
 
-/* ── Sincronizacion del worker thread ────────────────────────────────── */
+/* ── Worker thread synchronization ────────────────────────────────── */
 #ifdef _WIN32
   static HANDLE g_worker_thread = NULL;
   static HANDLE g_cmd_event = NULL;
@@ -301,13 +341,233 @@ static volatile int g_cmd_result = 0;
 static char g_init_base_dir[PATHBUF_SIZE];
 static volatile int g_debug = 0;
 
-/* ── Sleep multiplataforma ───────────────────────────────────────────── */
+/* ── Cross-platform sleep ───────────────────────────────────────────── */
 static void msleep(int ms) {
 #ifdef _WIN32
     Sleep(ms);
 #else
     usleep(ms * 1000);
 #endif
+}
+
+/* ── VFS (Virtual File System) ────────────────────────────────────────── */
+#define VFS_MAX_FILES 256
+#define VFS_PATH_MAX  512
+
+typedef struct {
+    char    path[VFS_PATH_MAX];   /* normalized key (no leading /) */
+    char*   data;                 /* malloc'd copy */
+    size_t  size;
+} VfsEntry;
+
+static VfsEntry      g_vfs_files[VFS_MAX_FILES];
+static int           g_vfs_count = 0;
+
+/* Normalize path: replace \ with /, strip leading / */
+static void vfs_normalize_path(const char* src, char* dst, size_t dst_size) {
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    size_t j = 0;
+    size_t start = 0;
+    /* Strip file:/// prefix */
+    if (len > 8 && strncmp(src, "file:///", 8) == 0) start = 8;
+    for (size_t i = start; i < len && j < dst_size - 1; i++) {
+        char c = src[i];
+        if (c == '\\') c = '/';
+        dst[j++] = c;
+    }
+    dst[j] = '\0';
+    /* Strip leading / */
+    char* p = dst;
+    while (*p == '/') p++;
+    if (p != dst) memmove(dst, p, strlen(p) + 1);
+}
+
+/* Find VFS entry by normalized path */
+static int vfs_find(const char* normalized) {
+    for (int i = 0; i < g_vfs_count; i++) {
+        if (strcmp(g_vfs_files[i].path, normalized) == 0) return i;
+    }
+    return -1;
+}
+
+/* Extract path from ULString to normalized C buffer */
+static void vfs_extract_path(ULString s, char* out, size_t out_size) {
+    if (!pfn_StringGetData || !pfn_StringGetLength) { out[0] = '\0'; return; }
+    char* data = pfn_StringGetData(s);
+    size_t len = pfn_StringGetLength(s);
+    if (!data || len == 0) { out[0] = '\0'; return; }
+    char raw[VFS_PATH_MAX];
+    if (len >= VFS_PATH_MAX) len = VFS_PATH_MAX - 1;
+    memcpy(raw, data, len);
+    raw[len] = '\0';
+    vfs_normalize_path(raw, out, out_size);
+}
+
+/* MIME type by file extension */
+static const char* vfs_mime_for_ext(const char* path) {
+    const char* dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (strcmp(dot, ".html") == 0 || strcmp(dot, ".htm") == 0) return "text/html";
+    if (strcmp(dot, ".css") == 0) return "text/css";
+    if (strcmp(dot, ".js") == 0) return "application/javascript";
+    if (strcmp(dot, ".json") == 0) return "application/json";
+    if (strcmp(dot, ".png") == 0) return "image/png";
+    if (strcmp(dot, ".jpg") == 0 || strcmp(dot, ".jpeg") == 0) return "image/jpeg";
+    if (strcmp(dot, ".gif") == 0) return "image/gif";
+    if (strcmp(dot, ".svg") == 0) return "image/svg+xml";
+    if (strcmp(dot, ".woff") == 0) return "font/woff";
+    if (strcmp(dot, ".woff2") == 0) return "font/woff2";
+    if (strcmp(dot, ".ttf") == 0) return "font/ttf";
+    if (strcmp(dot, ".ico") == 0) return "image/x-icon";
+    if (strcmp(dot, ".xml") == 0) return "text/xml";
+    if (strcmp(dot, ".txt") == 0) return "text/plain";
+    return "application/octet-stream";
+}
+
+/* Build full disk fallback path */
+static void vfs_disk_path(const char* normalized, char* out, size_t out_size) {
+    snprintf(out, out_size, "%s%c%s", g_init_base_dir, PATH_SEP, normalized);
+    /* Convert / to native PATH_SEP */
+#ifdef _WIN32
+    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
+#endif
+}
+
+/* Callback to free disk data when Ultralight destroys the buffer */
+static void vfs_free_disk_data(void* user_data, void* data) {
+    (void)user_data;
+    free(data);
+}
+
+/* ── Clipboard callbacks for ulPlatformSetClipboard ───────────────── */
+#ifdef _WIN32
+
+static void clipboard_cb_clear(void) {
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        CloseClipboard();
+    }
+}
+
+static void clipboard_cb_read(ULString result) {
+    if (!OpenClipboard(NULL)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (h) {
+        wchar_t* wtext = (wchar_t*)GlobalLock(h);
+        if (wtext) {
+            int len = WideCharToMultiByte(CP_UTF8, 0, wtext, -1, NULL, 0, NULL, NULL);
+            if (len > 0) {
+                char* utf8 = (char*)malloc(len);
+                WideCharToMultiByte(CP_UTF8, 0, wtext, -1, utf8, len, NULL, NULL);
+                pfn_StringAssignCString(result, utf8);
+                free(utf8);
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+}
+
+static void clipboard_cb_write(ULString text) {
+    char* data = pfn_StringGetData(text);
+    size_t len = pfn_StringGetLength(text);
+    if (!data || len == 0) return;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, data, (int)len, NULL, 0);
+    if (wlen <= 0) return;
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (wlen + 1) * sizeof(wchar_t));
+    if (!hMem) return;
+    wchar_t* dest = (wchar_t*)GlobalLock(hMem);
+    MultiByteToWideChar(CP_UTF8, 0, data, (int)len, dest, wlen);
+    dest[wlen] = L'\0';
+    GlobalUnlock(hMem);
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        SetClipboardData(CF_UNICODETEXT, hMem);
+        CloseClipboard();
+    } else {
+        GlobalFree(hMem);
+    }
+}
+
+#else /* POSIX clipboard stubs (no X11/Wayland integration yet) */
+
+static char g_posix_clipboard[4096] = {0};
+
+static void clipboard_cb_clear(void) {
+    g_posix_clipboard[0] = '\0';
+}
+
+static void clipboard_cb_read(ULString result) {
+    pfn_StringAssignCString(result, g_posix_clipboard);
+}
+
+static void clipboard_cb_write(ULString text) {
+    char* data = pfn_StringGetData(text);
+    size_t len = pfn_StringGetLength(text);
+    if (!data || len == 0) { g_posix_clipboard[0] = '\0'; return; }
+    if (len >= sizeof(g_posix_clipboard)) len = sizeof(g_posix_clipboard) - 1;
+    memcpy(g_posix_clipboard, data, len);
+    g_posix_clipboard[len] = '\0';
+}
+
+#endif /* _WIN32 / POSIX clipboard */
+
+/* ── VFS callbacks for ulPlatformSetFileSystem (Ultralight 1.4 API) ── */
+static bool vfs_cb_file_exists(ULString path_str) {
+    char norm[VFS_PATH_MAX];
+    vfs_extract_path(path_str, norm, VFS_PATH_MAX);
+    if (norm[0] == '\0') return false;
+    /* Check VFS first */
+    if (vfs_find(norm) >= 0) { blog("vfs_exists: VFS hit '%s'", norm); return true; }
+    /* Fallback to disk */
+    char disk[PATHBUF_SIZE];
+    vfs_disk_path(norm, disk, PATHBUF_SIZE);
+    FILE* f = fopen(disk, "rb");
+    if (f) { fclose(f); blog("vfs_exists: disk hit '%s'", disk); return true; }
+    blog("vfs_exists: miss '%s'", norm);
+    return false;
+}
+
+static ULString vfs_cb_get_file_mime_type(ULString path_str) {
+    char norm[VFS_PATH_MAX];
+    vfs_extract_path(path_str, norm, VFS_PATH_MAX);
+    const char* mime = vfs_mime_for_ext(norm);
+    blog("vfs_mime: '%s' -> '%s'", norm, mime);
+    return pfn_CreateString(mime);
+}
+
+static ULString vfs_cb_get_file_charset(ULString path_str) {
+    return pfn_CreateString("utf-8");
+}
+
+/* open_file: returns ULBuffer with full file data (Ultralight 1.4) */
+static ULBuffer vfs_cb_open_file(ULString path_str) {
+    char norm[VFS_PATH_MAX];
+    vfs_extract_path(path_str, norm, VFS_PATH_MAX);
+    if (norm[0] == '\0') return NULL;
+    /* Check VFS first: zero-copy wrap (VFS owns data) */
+    int idx = vfs_find(norm);
+    if (idx >= 0) {
+        VfsEntry* e = &g_vfs_files[idx];
+        blog("vfs_open: VFS '%s' size=%zu", norm, e->size);
+        return pfn_CreateBuffer(e->data, e->size, NULL, NULL);
+    }
+    /* Fallback to disk: read full file, Ultralight frees via callback */
+    char disk[PATHBUF_SIZE];
+    vfs_disk_path(norm, disk, PATHBUF_SIZE);
+    FILE* f = fopen(disk, "rb");
+    if (!f) { blog("vfs_open: NOT FOUND '%s'", norm); return NULL; }
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size <= 0) { fclose(f); blog("vfs_open: empty '%s'", disk); return NULL; }
+    char* buf = (char*)malloc((size_t)file_size);
+    if (!buf) { fclose(f); blog("vfs_open: OOM '%s' size=%ld", disk, file_size); return NULL; }
+    size_t read = fread(buf, 1, (size_t)file_size, f);
+    fclose(f);
+    blog("vfs_open: disk '%s' size=%zu", disk, read);
+    return pfn_CreateBuffer(buf, read, NULL, vfs_free_disk_data);
 }
 
 /* ── Console message callback ────────────────────────────────────────── */
@@ -331,7 +591,7 @@ static void console_message_cb(void* user_data, ULView caller, ULMessageSource s
     v->console_count++;
 }
 
-/* ── Resolucion de simbolos ──────────────────────────────────────────── */
+/* ── Symbol resolution ──────────────────────────────────────────── */
 #ifdef _WIN32
   #define GETSYM(handle, name) (void*)GetProcAddress((HMODULE)(handle), (name))
 #else
@@ -350,6 +610,7 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_CreateConfig, "ulCreateConfig");
     RESOLVE(g_hUltralight, pfn_DestroyConfig, "ulDestroyConfig");
     RESOLVE(g_hUltralight, pfn_ConfigSetResourcePathPrefix, "ulConfigSetResourcePathPrefix");
+    RESOLVE(g_hUltralight, pfn_ConfigSetCachePath, "ulConfigSetCachePath");
     RESOLVE(g_hUltralight, pfn_CreateRenderer, "ulCreateRenderer");
     RESOLVE(g_hUltralight, pfn_DestroyRenderer, "ulDestroyRenderer");
     RESOLVE(g_hUltralight, pfn_Update, "ulUpdate");
@@ -387,6 +648,11 @@ static int resolve_functions(void) {
     RESOLVE(g_hAppCore, pfn_EnablePlatformFontLoader, "ulEnablePlatformFontLoader");
     RESOLVE(g_hAppCore, pfn_EnablePlatformFileSystem, "ulEnablePlatformFileSystem");
     RESOLVE(g_hAppCore, pfn_EnableDefaultLogger, "ulEnableDefaultLogger");
+    RESOLVE(g_hUltralight, pfn_PlatformSetFileSystem, "ulPlatformSetFileSystem");
+    RESOLVE(g_hUltralight, pfn_CreateBuffer, "ulCreateBuffer");
+    RESOLVE(g_hUltralight, pfn_CreateBufferFromCopy, "ulCreateBufferFromCopy");
+    RESOLVE(g_hUltralight, pfn_PlatformSetClipboard, "ulPlatformSetClipboard");
+    RESOLVE(g_hUltralight, pfn_StringAssignCString, "ulStringAssignCString");
     /* JS context (Ultralight) */
     RESOLVE(g_hUltralight, pfn_ViewLockJSContext, "ulViewLockJSContext");
     RESOLVE(g_hUltralight, pfn_ViewUnlockJSContext, "ulViewUnlockJSContext");
@@ -406,11 +672,11 @@ static int resolve_functions(void) {
 #undef RESOLVE
 #undef GETSYM
 
-/* JSC native callback: se invoca cuando JS llama window.__goSend(msg).
- * user_data codifica el view ID. Corre en el worker thread. */
+/* JSC native callback: invoked when JS calls window.__goSend(msg).
+ * Runs on the worker thread. */
 static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     JSObjectRef thisObject, size_t argumentCount, const JSValueRef arguments[], JSValueRef* exception) {
-    /* Buscar view ID por contexto JSC */
+    /* Find view ID by JSC context */
     int vid = -1;
     for (int i = 0; i < MAX_VIEWS; i++) {
         if (g_views[i].used && g_views[i].view) {
@@ -422,7 +688,7 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     if (vid < 0) { blog("jsc_goSend_callback: no matching view for ctx"); return NULL; }
     if (argumentCount < 1) { blog("jsc_goSend_callback: no args"); return NULL; }
 
-    /* Convertir primer argumento a UTF-8 */
+    /* Convert first argument to UTF-8 */
     JSStringRef jsStr = pfn_JSValueToStringCopy(ctx, arguments[0], NULL);
     if (!jsStr) { blog("jsc_goSend_callback: JSValueToStringCopy failed"); return NULL; }
 
@@ -431,7 +697,7 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
 
     if (v->msg_count < MSG_QUEUE_MAX && maxLen < MSG_QUEUE_BUFLEN) {
         size_t written = pfn_JSStringGetUTF8CString(jsStr, v->msg_queue[v->msg_head], MSG_QUEUE_BUFLEN);
-        if (written > 0) written--; /* JSStringGetUTF8CString incluye null en el conteo */
+        if (written > 0) written--; /* JSStringGetUTF8CString includes null in the count */
         v->msg_lens[v->msg_head] = (int)written;
         v->msg_head = (v->msg_head + 1) % MSG_QUEUE_MAX;
         v->msg_count++;
@@ -443,8 +709,8 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     return NULL;
 }
 
-/* Registrar window.__goSend y window.go.send como funciones nativas JSC.
- * Debe llamarse en el worker thread cuando el contexto JS esta listo. */
+/* Register window.__goSend and window.go.send as native JSC functions.
+ * Must be called on the worker thread when the JS context is ready. */
 static void setup_js_bindings(int vid) {
     if (vid < 0 || vid >= MAX_VIEWS || !g_views[vid].used) return;
     ViewSlot* v = &g_views[vid];
@@ -454,7 +720,7 @@ static void setup_js_bindings(int vid) {
 
     JSObjectRef global = pfn_JSContextGetGlobalObject(ctx);
 
-    /* Registrar window.__goSend */
+    /* Register window.__goSend */
     JSStringRef fnName = pfn_JSStringCreateWithUTF8CString("__goSend");
     JSObjectRef fnObj = pfn_JSObjectMakeFunctionWithCallback(ctx, fnName, jsc_goSend_callback);
     pfn_JSObjectSetProperty(ctx, global, fnName, fnObj, 0, NULL);
@@ -462,7 +728,7 @@ static void setup_js_bindings(int vid) {
 
     pfn_ViewUnlockJSContext(v->view);
 
-    /* Configurar namespace window.go (preservar props existentes) */
+    /* Set up window.go namespace (preserve existing props) */
     ULString goNs = pfn_CreateString("window.go=window.go||{};window.go.send=window.__goSend;");
     pfn_ViewEvaluateScript(v->view, goNs, NULL);
     pfn_DestroyString(goNs);
@@ -478,13 +744,38 @@ static int worker_do_init(void) {
         pfn_DestroyString(lp);
     }
     pfn_EnablePlatformFontLoader();
-    ULString bd = pfn_CreateString(g_init_base_dir);
-    pfn_EnablePlatformFileSystem(bd);
-    pfn_DestroyString(bd);
+    /* Custom VFS: Check VFS first, fall back to disk (g_init_base_dir) */
+    ULFileSystem fs;
+    fs.file_exists       = vfs_cb_file_exists;
+    fs.get_file_mime_type = vfs_cb_get_file_mime_type;
+    fs.get_file_charset  = vfs_cb_get_file_charset;
+    fs.open_file         = vfs_cb_open_file;
+    pfn_PlatformSetFileSystem(fs);
+    /* Clipboard support (Ctrl+C/V/X) */
+    ULClipboard cb;
+    cb.clear           = clipboard_cb_clear;
+    cb.read_plain_text = clipboard_cb_read;
+    cb.write_plain_text = clipboard_cb_write;
+    pfn_PlatformSetClipboard(cb);
     ULConfig config = pfn_CreateConfig();
     ULString rp = pfn_CreateString("/");
     pfn_ConfigSetResourcePathPrefix(config, rp);
     pfn_DestroyString(rp);
+    /* Cache path: use system TEMP to avoid creating folders next to the exe */
+    {
+        char tmp[PATHBUF_SIZE];
+#ifdef _WIN32
+        DWORD len = GetTempPathA(PATHBUF_SIZE, tmp);
+        if (len > 0 && len < PATHBUF_SIZE) {
+            strncat(tmp, "ultralight_cache", PATHBUF_SIZE - len - 1);
+        }
+#else
+        snprintf(tmp, PATHBUF_SIZE, "/tmp/ultralight_cache");
+#endif
+        ULString cp = pfn_CreateString(tmp);
+        pfn_ConfigSetCachePath(config, cp);
+        pfn_DestroyString(cp);
+    }
     g_renderer = pfn_CreateRenderer(config);
     pfn_DestroyConfig(config);
     if (!g_renderer) { blog("worker_do_init: renderer NULL"); return -10; }
@@ -548,7 +839,7 @@ static void worker_do_load(int vid, const char* str, bool is_url) {
         msleep(10);
     }
     pfn_Render(g_renderer);
-    /* Re-registrar bindings JSC (la carga de pagina resetea el contexto JS) */
+    /* Re-register JSC bindings (page load resets the JS context) */
     setup_js_bindings(vid);
 }
 
@@ -576,7 +867,7 @@ static void worker_do_tick(void) {
         v->scroll_count = 0;
         for (int i = 0; i < v->key_count; i++) {
             KeyQueueEntry* e = &v->key_queue[i];
-            /* Mapear tipo (0=RawKeyDown,1=KeyDown,2=KeyUp,3=Char) a enum SDK (0=KeyDown,1=KeyUp,2=RawKeyDown,3=Char) */
+            /* Map type (0=RawKeyDown,1=KeyDown,2=KeyUp,3=Char) to SDK enum (0=KeyDown,1=KeyUp,2=RawKeyDown,3=Char) */
             unsigned int ul_type = (unsigned int)(e->type == 0 ? 2 : e->type == 1 ? 0 : e->type == 2 ? 1 : 3);
             ULString s_text = pfn_CreateString(e->text[0] ? e->text : "");
             ULString s_umod = pfn_CreateString(e->text[0] ? e->text : "");
@@ -599,7 +890,7 @@ static void worker_do_tick(void) {
     pfn_Render(g_renderer);
 }
 
-/* ── send_cmd / worker_thread_proc (plataforma-especifico) ───────────── */
+/* ── send_cmd / worker_thread_proc (platform-specific) ───────────── */
 #ifdef _WIN32
 
 static void send_cmd(enum CmdType cmd, const char* str_arg, int i1, int i2) {
@@ -719,7 +1010,7 @@ static void* worker_thread_proc(void* param) {
 
 #endif /* _WIN32 / POSIX */
 
-/* ── Carga de librerias SDK ──────────────────────────────────────────── */
+/* ── SDK library loading ──────────────────────────────────────────── */
 #ifdef _WIN32
 
 static int load_sdk_libs(const char* base_dir) {
@@ -768,7 +1059,7 @@ static int load_sdk_libs(const char* base_dir) {
 
 #endif /* _WIN32 / POSIX */
 
-/* ── Funciones exportadas para Go ────────────────────────────────────── */
+/* ── Exported functions for Go ────────────────────────────────────── */
 EXPORT int ul_init(const char* base_dir, int debug) {
     g_debug = debug;
     if (g_debug) {
@@ -946,6 +1237,50 @@ EXPORT int ul_view_get_console_message(int view_id, char* buf, int buf_size) {
     return cl;
 }
 
+/* ── VFS exports for Go ──────────────────────────────────────────────── */
+EXPORT int ul_vfs_register(const char* path, const void* data, long long size) {
+    if (!path || !data || size < 0) return -1;
+    char norm[VFS_PATH_MAX];
+    vfs_normalize_path(path, norm, VFS_PATH_MAX);
+    /* Overwrite if already exists */
+    int idx = vfs_find(norm);
+    if (idx >= 0) {
+        free(g_vfs_files[idx].data);
+        g_vfs_files[idx].data = (char*)malloc((size_t)size);
+        if (!g_vfs_files[idx].data) return -2;
+        memcpy(g_vfs_files[idx].data, data, (size_t)size);
+        g_vfs_files[idx].size = (size_t)size;
+        blog("vfs_register: overwrite '%s' size=%lld", norm, size);
+        return 0;
+    }
+    if (g_vfs_count >= VFS_MAX_FILES) { blog("vfs_register: FULL"); return -3; }
+    VfsEntry* e = &g_vfs_files[g_vfs_count];
+    strncpy(e->path, norm, VFS_PATH_MAX - 1);
+    e->path[VFS_PATH_MAX - 1] = '\0';
+    e->data = (char*)malloc((size_t)size);
+    if (!e->data) return -2;
+    memcpy(e->data, data, (size_t)size);
+    e->size = (size_t)size;
+    g_vfs_count++;
+    blog("vfs_register: '%s' size=%lld count=%d", norm, size, g_vfs_count);
+    return 0;
+}
+
+EXPORT void ul_vfs_clear(void) {
+    for (int i = 0; i < g_vfs_count; i++) {
+        free(g_vfs_files[i].data);
+        g_vfs_files[i].data = NULL;
+        g_vfs_files[i].size = 0;
+        g_vfs_files[i].path[0] = '\0';
+    }
+    g_vfs_count = 0;
+    blog("vfs_clear: done");
+}
+
+EXPORT int ul_vfs_count(void) {
+    return g_vfs_count;
+}
+
 EXPORT void ul_destroy(void) {
 #ifdef _WIN32
     if (g_worker_thread) {
@@ -966,10 +1301,11 @@ EXPORT void ul_destroy(void) {
     pthread_cond_destroy(&g_cmd_cond);
     pthread_cond_destroy(&g_done_cond);
 #endif
+    ul_vfs_clear();
     if (g_log) { fclose(g_log); g_log = NULL; }
 }
 
-/* ── DllMain (solo Windows) ──────────────────────────────────────────── */
+/* ── DllMain (Windows only) ──────────────────────────────────────────── */
 #ifdef _WIN32
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     return TRUE;
