@@ -5,10 +5,8 @@ package ultralightui
 
 import (
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"sync"
-	"syscall"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -115,28 +113,15 @@ func unregisterView() {
 	viewCountMu.Unlock()
 }
 
-func doInitBridge(baseDir string) error {
-	dllPath := filepath.Join(baseDir, "ul_bridge.dll")
-	absPath, err := filepath.Abs(dllPath)
-	if err != nil {
-		absPath = dllPath
-	}
-	lib, err := syscall.LoadLibrary(absPath)
-	if err != nil {
-		return fmt.Errorf("failed to load ul_bridge.dll from %s: %w", absPath, err)
-	}
-	h := uintptr(lib)
-
-	if err := registerSymbol(&ulInit, h, "ul_init"); err != nil {
-		return fmt.Errorf("ul_init: %w (recompile ul_bridge.dll)", err)
-	}
-	if err := registerSymbol(&ulCreateView, h, "ul_create_view"); err != nil {
-		return fmt.Errorf("ul_create_view: %w (recompile ul_bridge.dll)", err)
-	}
+// resolveAllSymbols registra todos los simbolos exportados del bridge usando
+// getSymbolAddr (definida en bridge_windows.go o bridge_unix.go).
+func resolveAllSymbols(handle uintptr) error {
 	for _, reg := range []struct {
 		fptr interface{}
 		name string
 	}{
+		{&ulInit, "ul_init"},
+		{&ulCreateView, "ul_create_view"},
 		{&ulDestroyView, "ul_destroy_view"},
 		{&ulViewLoadHTML, "ul_view_load_html"},
 		{&ulViewLoadURL, "ul_view_load_url"},
@@ -154,22 +139,12 @@ func doInitBridge(baseDir string) error {
 		{&ulViewGetConsoleMessage, "ul_view_get_console_message"},
 		{&ulDestroy, "ul_destroy"},
 	} {
-		if err := registerSymbol(reg.fptr, h, reg.name); err != nil {
+		sym, err := getSymbolAddr(handle, reg.name)
+		if err != nil {
 			return fmt.Errorf("%s: %w", reg.name, err)
 		}
+		purego.RegisterFunc(reg.fptr, sym)
 	}
-	return nil
-}
-
-func registerSymbol(fptr interface{}, handle uintptr, name string) error {
-	sym, err := syscall.GetProcAddress(syscall.Handle(handle), name)
-	if err != nil {
-		return err
-	}
-	if sym == 0 {
-		return fmt.Errorf("symbol %q not found in DLL", name)
-	}
-	purego.RegisterFunc(fptr, sym)
 	return nil
 }
 

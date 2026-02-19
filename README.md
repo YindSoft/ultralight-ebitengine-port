@@ -12,13 +12,13 @@ Render HTML/CSS/JS interfaces as textures in [Ebitengine](https://ebitengine.org
 ## Architecture
 
 ```
-Go (Ebitengine) <--purego--> ul_bridge.dll (GCC) <--LoadLibrary--> Ultralight 1.4 DLLs
+Go (Ebitengine) <--purego--> ul_bridge shared lib (GCC) <--dlopen/LoadLibrary--> Ultralight 1.4 libs
 ```
 
-The C bridge DLL (`ul_bridge.c`) runs all Ultralight API calls on a dedicated worker thread
-(Ultralight requires single-thread affinity). Go communicates with it through simple exported
-functions via purego. No CGo is needed because GCC and Go's linker have format incompatibilities
-on Windows (`pe-bigobj`).
+The C bridge shared library (`ul_bridge.c`) runs all Ultralight API calls on a dedicated worker
+thread (Ultralight requires single-thread affinity). Go communicates with it through simple
+exported functions via purego. On Windows it uses Win32 APIs (`LoadLibrary`, `CreateThread`,
+`CreateEvent`); on Linux/macOS it uses POSIX equivalents (`dlopen`, `pthread`, `pthread_cond`).
 
 ## Setup
 
@@ -28,66 +28,82 @@ on Windows (`pe-bigobj`).
 |------|---------|----------|
 | [Go](https://go.dev/dl/) | 1.21+ | Build your application |
 | [Ebitengine](https://ebitengine.org) | v2.8+ | Game engine (pulled automatically by `go mod`) |
-| [GCC for Windows](https://github.com/skeeto/w64devkit/releases) | Any | Compile `ul_bridge.dll` from source |
+| GCC | Any | Compile the bridge shared library from source ([w64devkit](https://github.com/skeeto/w64devkit/releases) on Windows, system GCC on Linux/macOS) |
 | [Ultralight SDK](https://ultralig.ht) | 1.4 | HTML rendering engine (download separately) |
 
 ### Step 1: Download the Ultralight 1.4 SDK
 
 Go to [ultralig.ht/download](https://ultralig.ht/download/) (requires a free account) and download
-the **Windows x64** SDK. Extract the archive. You'll get a folder like this:
+the SDK for your platform (Windows x64, Linux x64, or macOS). Extract the archive. You'll get a folder like this:
 
 ```
 ultralight-sdk/
   bin/
-    Ultralight.dll
-    UltralightCore.dll
-    WebCore.dll
-    AppCore.dll
+    Ultralight.dll / libUltralight.so / libUltralight.dylib
+    UltralightCore.dll / libUltralightCore.so / libUltralightCore.dylib
+    WebCore.dll / libWebCore.so / libWebCore.dylib
+    AppCore.dll / libAppCore.so / libAppCore.dylib
   resources/
     cacert.pem
     icudt67l.dat        <-- ICU Unicode data (required for all text/JS)
   include/              <-- C headers (not needed at runtime)
-  lib/                  <-- .lib files (not needed, we load DLLs at runtime)
+  lib/                  <-- .lib/.a files (not needed, we load libs at runtime)
   ...
 ```
 
 ### Step 2: Copy SDK files to your project
 
-Copy the following files into the **working directory** of your application
+Copy the SDK libraries and data files into the **working directory** of your application
 (typically the folder where your `main.go` is, or wherever you run the executable from):
 
 ```bash
-# From the SDK archive:
-cp ultralight-sdk/bin/Ultralight.dll      your-project/
-cp ultralight-sdk/bin/UltralightCore.dll  your-project/
-cp ultralight-sdk/bin/WebCore.dll         your-project/
-cp ultralight-sdk/bin/AppCore.dll         your-project/
+# From the SDK archive (use the files matching your platform):
+cp ultralight-sdk/bin/*Ultralight*      your-project/
+cp ultralight-sdk/bin/*UltralightCore*  your-project/
+cp ultralight-sdk/bin/*WebCore*         your-project/
+cp ultralight-sdk/bin/*AppCore*         your-project/
 cp ultralight-sdk/resources/icudt67l.dat  your-project/
 ```
 
-**What each file does:**
+**SDK library names per platform:**
 
-| File | Size | Purpose |
-|------|------|---------|
-| `Ultralight.dll` | ~1 MB | Core Ultralight API (renderer, views, surfaces) |
-| `UltralightCore.dll` | ~4 MB | Low-level rendering backend |
-| `WebCore.dll` | ~35 MB | HTML/CSS/JS engine (WebKit fork + JavaScriptCore) |
-| `AppCore.dll` | ~0.5 MB | Platform helpers (font loader, file system, logger) |
+| Library | Windows | Linux | macOS |
+|---------|---------|-------|-------|
+| Ultralight | `Ultralight.dll` | `libUltralight.so` | `libUltralight.dylib` |
+| UltralightCore | `UltralightCore.dll` | `libUltralightCore.so` | `libUltralightCore.dylib` |
+| WebCore | `WebCore.dll` | `libWebCore.so` | `libWebCore.dylib` |
+| AppCore | `AppCore.dll` | `libAppCore.so` | `libAppCore.dylib` |
+
+**What each library does:**
+
+| Library | Size | Purpose |
+|---------|------|---------|
+| Ultralight | ~1 MB | Core Ultralight API (renderer, views, surfaces) |
+| UltralightCore | ~4 MB | Low-level rendering backend |
+| WebCore | ~35 MB | HTML/CSS/JS engine (WebKit fork + JavaScriptCore) |
+| AppCore | ~0.5 MB | Platform helpers (font loader, file system, logger) |
 | `icudt67l.dat` | ~25 MB | [ICU](https://icu.unicode.org/) Unicode data tables. Required for all text rendering, JavaScript string operations, CSS text layout, regex, and locale-aware formatting. Without this file, Ultralight cannot process any text. |
 
 ### Step 3: Compile the bridge DLL
 
-The bridge DLL is the thin C layer between Go and Ultralight. The source is included in this
+The bridge is a thin C layer between Go and Ultralight. The source is included in this
 repository at [`bridge/ul_bridge.c`](bridge/ul_bridge.c). Compile it with GCC:
 
 ```bash
+# Windows:
 gcc -shared -o ul_bridge.dll bridge/ul_bridge.c -O2 -lkernel32
+
+# Linux:
+gcc -shared -fPIC -o libul_bridge.so bridge/ul_bridge.c -O2 -lpthread -ldl
+
+# macOS:
+gcc -shared -fPIC -o libul_bridge.dylib bridge/ul_bridge.c -O2 -lpthread -ldl
 ```
 
-> **Tip**: If you don't have GCC in your PATH, download [w64devkit](https://github.com/skeeto/w64devkit/releases),
+> **Windows tip**: If you don't have GCC in your PATH, download [w64devkit](https://github.com/skeeto/w64devkit/releases),
 > extract it, and run from its shell. It's a single portable zip, no installer needed.
 
-Place the resulting `ul_bridge.dll` in the same directory as the Ultralight DLLs.
+Place the resulting shared library in the same directory as the Ultralight SDK libraries.
 
 ### Step 4: Add the Go module
 
@@ -104,17 +120,17 @@ your-project/
   main.go
   go.mod
   go.sum
-  Ultralight.dll          \
-  UltralightCore.dll       |  from Ultralight SDK
-  WebCore.dll              |
-  AppCore.dll              |
-  icudt67l.dat            /
-  ul_bridge.dll           <-- compiled from bridge/ul_bridge.c
+  Ultralight.dll / libUltralight.so / libUltralight.dylib       \
+  UltralightCore.dll / libUltralightCore.so / ...                 |  from Ultralight SDK
+  WebCore.dll / libWebCore.so / ...                               |
+  AppCore.dll / libAppCore.so / ...                               |
+  icudt67l.dat                                                   /
+  ul_bridge.dll / libul_bridge.so / libul_bridge.dylib   <-- compiled from bridge/ul_bridge.c
   ui/
     index.html            <-- your HTML interface
 ```
 
-You can also place the DLLs in a separate directory and pass it via `Options.BaseDir`.
+You can also place the libraries in a separate directory and pass it via `Options.BaseDir`.
 
 ## Quick Start
 
@@ -174,7 +190,7 @@ ui, err := ultralightui.NewFromURL(width, height, "https://example.com", nil)
 
 ```go
 opts := &ultralightui.Options{
-    BaseDir: "/path/to/dlls",  // Where to find ul_bridge.dll and SDK DLLs (default: working dir)
+    BaseDir: "/path/to/libs",  // Where to find the bridge and SDK libraries (default: working dir)
     Debug:   true,             // Create bridge.log and ultralight.log for troubleshooting
 }
 ui, err := ultralightui.NewFromFile(800, 600, "ui/index.html", opts)
@@ -262,6 +278,8 @@ of your game rendering. Use CSS `background: rgba(...)` for semi-transparent pan
 
 ## Example
 
+![screenshot](screenshot.png)
+
 See the [`example/`](example/) directory for a complete working demo with two views,
 animated Ebiten shapes behind HTML, bidirectional communication, and keyboard input.
 
@@ -272,13 +290,13 @@ cd example
 go run .
 ```
 
-The example expects the DLLs to be in the parent directory (the repo root).
+The example expects the SDK libraries to be in the parent directory (the repo root).
 
 ## How it works
 
-1. `ul_bridge.dll` loads the Ultralight SDK DLLs at runtime via `LoadLibrary`/`GetProcAddress`
+1. The bridge shared library loads the Ultralight SDK at runtime via `LoadLibrary`/`GetProcAddress` (Windows) or `dlopen`/`dlsym` (Linux/macOS)
 2. A dedicated worker thread handles all Ultralight API calls (renderer, views, JS eval)
-3. Go sends commands to the worker thread via a simple command queue with Win32 events
+3. Go sends commands to the worker thread via a simple command queue with platform-native synchronization (Win32 events on Windows, pthread mutex+cond on POSIX)
 4. Pixel data is read from Ultralight's surface bitmap (BGRA), converted to RGBA, and written to an Ebiten image
 5. JS -> Go communication uses JavaScriptCore's native C API (`JSObjectMakeFunctionWithCallback`) to register `window.go.send()` as a native function that pushes messages to a queue
 6. Go -> JS communication calls `window.go.receive(data)` via `ulViewEvaluateScript`
@@ -287,18 +305,23 @@ The example expects the DLLs to be in the parent directory (the repo root).
 
 | Problem | Solution |
 |---------|----------|
-| `failed to load ul_bridge.dll` | Make sure `ul_bridge.dll` is in your working directory or in `Options.BaseDir`. Recompile it if needed. |
-| `FAIL: Ultralight` / `FAIL: WebCore` in bridge.log | One of the SDK DLLs is missing. Copy all 4 DLLs from the SDK `bin/` folder. |
+| `failed to load ul_bridge` | Make sure the bridge shared library (`ul_bridge.dll` / `libul_bridge.so` / `libul_bridge.dylib`) is in your working directory or in `Options.BaseDir`. Recompile it if needed. |
+| `FAIL: Ultralight` / `FAIL: WebCore` in bridge.log | One of the SDK libraries is missing. Copy all 4 libraries from the SDK `bin/` folder. |
 | All pixels are zero / blank screen | Make sure `icudt67l.dat` is present. Enable `Debug: true` and check `ultralight.log`. |
 | Buttons don't respond to clicks | Verify `SetBounds()` matches where you draw the texture. Input is only forwarded inside bounds. |
 | Keyboard doesn't work | Call `SetFocus()` on the view, or click inside it first. |
 
 ## Platform support
 
-Currently **Windows only**. The C bridge uses Win32 APIs (`LoadLibrary`, `CreateThread`,
-`CreateEvent`, etc.). Ultralight itself supports Linux and macOS, so cross-platform support
-is possible by porting the bridge to use POSIX equivalents (`dlopen`, `pthread`).
-Contributions welcome.
+| Platform | Bridge library | SDK libraries | Status |
+|----------|---------------|---------------|--------|
+| Windows x64 | `ul_bridge.dll` | `*.dll` | Tested |
+| Linux x64 | `libul_bridge.so` | `lib*.so` | Supported (requires Ultralight Linux SDK) |
+| macOS x64/arm64 | `libul_bridge.dylib` | `lib*.dylib` | Supported (requires Ultralight macOS SDK) |
+
+The C bridge uses `#ifdef _WIN32` to select between Win32 APIs and POSIX equivalents
+(`dlopen`/`dlsym`, `pthread_create`, `pthread_mutex`/`pthread_cond`). The Go side uses
+build tags (`bridge_windows.go`, `bridge_unix.go`) to select the library loading mechanism.
 
 ## License
 

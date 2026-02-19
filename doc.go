@@ -47,6 +47,8 @@
 // Mouse and scroll input are forwarded when the cursor is inside the view's bounds.
 // Keyboard input goes to whichever view has focus (via SetFocus or clicking).
 //
-// Requirements: ul_bridge.dll and the Ultralight 1.4 SDK DLLs must be present
-// next to the executable or in the directory specified by [Options.BaseDir].
+// Requirements: the bridge shared library (ul_bridge.dll on Windows,
+// libul_bridge.so on Linux, libul_bridge.dylib on macOS) and the Ultralight 1.4
+// SDK libraries must be present next to the executable or in the directory
+// specified by [Options.BaseDir].
 package ultralightui

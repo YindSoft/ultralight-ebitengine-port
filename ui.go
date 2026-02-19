@@ -37,7 +37,7 @@ func setFocusedViewID(viewID int32) {
 
 // Options for creating the UI. All fields are optional.
 type Options struct {
-	BaseDir string // Directory containing ul_bridge.dll and Ultralight SDK DLLs. Defaults to working directory.
+	BaseDir string // Directory containing the bridge shared library and Ultralight SDK libraries. Defaults to working directory.
 	Debug   bool   // Enable debug logging (creates bridge.log and ultralight.log). Default false.
 }
 
@@ -161,7 +161,7 @@ func resolveOpts(opts *Options) (string, bool) {
 	}
 	if baseDir == "" {
 		baseDir, _ = os.Getwd()
-		if _, err := os.Stat(filepath.Join(baseDir, "ul_bridge.dll")); err != nil {
+		if _, err := os.Stat(filepath.Join(baseDir, bridgeLibName())); err != nil {
 			if exe, _ := os.Executable(); exe != "" {
 				baseDir = filepath.Dir(exe)
 			}
