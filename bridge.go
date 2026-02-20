@@ -68,6 +68,11 @@ var (
 	ulVfsRegister           func(path string, data uintptr, size int64) int32
 	ulVfsClear              func()
 	ulVfsCount              func() int32
+	ulCreateViewAsync       func(width, height int32, url string) int32
+	ulViewIsReady           func(viewID int32) int32
+	ulViewCopyPixelsRGBA    func(viewID int32, dest uintptr, destSize int32) int32
+	ulCreateViewWithHTML    func(width, height int32, html string) int32
+	ulCreateViewWithURL     func(width, height int32, url string) int32
 )
 
 var (
@@ -109,10 +114,11 @@ func registerView() {
 func unregisterView() {
 	viewCountMu.Lock()
 	viewCount--
-	if viewCount <= 0 {
+	if viewCount < 0 {
 		viewCount = 0
-		ulDestroy()
 	}
+	// No llamar ulDestroy() al llegar a 0 vistas: el renderer vive toda la vida
+	// de la aplicacion. ulInit usa sync.Once y no puede re-inicializarse.
 	viewCountMu.Unlock()
 }
 
@@ -144,6 +150,11 @@ func resolveAllSymbols(handle uintptr) error {
 		{&ulVfsRegister, "ul_vfs_register"},
 		{&ulVfsClear, "ul_vfs_clear"},
 		{&ulVfsCount, "ul_vfs_count"},
+		{&ulCreateViewAsync, "ul_create_view_async"},
+		{&ulViewIsReady, "ul_view_is_ready"},
+		{&ulViewCopyPixelsRGBA, "ul_view_copy_pixels_rgba"},
+		{&ulCreateViewWithHTML, "ul_create_view_with_html"},
+		{&ulCreateViewWithURL, "ul_create_view_with_url"},
 	} {
 		sym, err := getSymbolAddr(handle, reg.name)
 		if err != nil {
@@ -159,8 +170,8 @@ func evalJS(viewID int32, js string) {
 }
 
 func pollMessage(viewID int32) (string, bool) {
-	var buf [2048]byte
-	n := ulViewGetMessage(viewID, uintptr(unsafe.Pointer(&buf[0])), 2048)
+	var buf [8192]byte
+	n := ulViewGetMessage(viewID, uintptr(unsafe.Pointer(&buf[0])), 8192)
 	if n <= 0 {
 		return "", false
 	}

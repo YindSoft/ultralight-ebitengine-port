@@ -187,6 +187,16 @@ ui, err := ultralightui.NewFromHTML(width, height, []byte("<h1>Hello</h1>"), nil
 ui, err := ultralightui.NewFromURL(width, height, "https://example.com", nil)
 ```
 
+All sync constructors (`NewFromFile`, `NewFromHTML`, `NewFromURL`, `NewFromFS`) return a
+fully loaded view in a single call (~3-7 ms). For non-blocking creation, use the async variant:
+
+```go
+// Async: returns immediately, view loads in the background (~5 ticks / ~83ms)
+ui, err := ultralightui.NewFromFSAsync(800, 600, "ui/index.html", uiFiles, nil)
+// ui.IsReady() returns false until loading completes
+// ui.Update() is safe to call immediately (renders transparent until ready)
+```
+
 ### Options
 
 ```go
@@ -363,14 +373,33 @@ go run .
 
 Both examples expect the SDK libraries to be in the parent directory (the repo root).
 
+## Performance
+
+View creation is optimized for minimal latency. The bridge uses a **fast sync path** that combines
+view creation and content loading into a single worker thread roundtrip with no sleep loops:
+
+| Scenario | Time |
+|----------|------|
+| Simple HTML | ~3 ms |
+| Complex HTML (commerce UI) | ~7 ms |
+| URL (file:/// with VFS) | ~2.5 ms |
+| 6 views (simple) | ~13 ms |
+| 6 views (complex) | ~35 ms |
+| First view (cold start, includes renderer init) | ~32 ms |
+
+The pixel pipeline uses an async goroutine for BGRA-to-RGBA conversion, keeping the main
+game loop free from blocking work. Dirty tracking ensures pixel copies only happen when the
+surface has actually changed.
+
 ## How it works (internals)
 
 1. The bridge shared library loads the Ultralight SDK at runtime via `LoadLibrary`/`GetProcAddress` (Windows) or `dlopen`/`dlsym` (Linux/macOS)
 2. A dedicated worker thread handles all Ultralight API calls (renderer, views, JS eval)
 3. Go sends commands to the worker thread via a simple command queue with platform-native synchronization (Win32 events on Windows, pthread mutex+cond on POSIX)
-4. Pixel data is read from Ultralight's surface bitmap (BGRA), converted to RGBA, and written to an Ebiten image
-5. JS -> Go communication uses JavaScriptCore's native C API (`JSObjectMakeFunctionWithCallback`) to register `window.go.send()` as a native function that pushes messages to a queue
-6. Go -> JS communication calls `window.go.receive(data)` via `ulViewEvaluateScript`
+4. View creation and content loading are combined into a single worker command (`CMD_CREATE_WITH_HTML` / `CMD_CREATE_WITH_URL`) for minimum latency
+5. Pixel data is read from Ultralight's surface bitmap (BGRA), converted to RGBA in an async goroutine, and written to an Ebiten image
+6. JS -> Go communication uses JavaScriptCore's native C API (`JSObjectMakeFunctionWithCallback`) to register `window.go.send()` as a native function that pushes messages to a queue
+7. Go -> JS communication calls `window.go.receive(data)` via `ulViewEvaluateScript`
 
 ## Troubleshooting
 

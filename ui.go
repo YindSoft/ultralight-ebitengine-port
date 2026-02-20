@@ -23,6 +23,12 @@ var (
 	focusedViewIDMu sync.Mutex
 )
 
+// ClearFocus removes keyboard focus from all views. After this call,
+// no UI receives key events (keys go back to the game).
+func ClearFocus() {
+	setFocusedViewID(-1)
+}
+
 func getFocusedViewID() int32 {
 	focusedViewIDMu.Lock()
 	defer focusedViewIDMu.Unlock()
@@ -61,6 +67,23 @@ type UltralightUI struct {
 	domReady       bool
 	frameCount     int
 	goHelperInjected bool
+
+	// dirtyCountdown: frames restantes para copiar pixels. Se decrementa cada frame.
+	// Cuando llega a 0, se deja de copiar (la textura queda congelada hasta el proximo markDirty).
+	dirtyCountdown int
+
+	// Pipeline async de pixels: la conversion BGRA→RGBA corre en un goroutine separado.
+	// Main thread hace memcpy rapido a rawBGRA y señala asyncWork.
+	// El goroutine convierte a pixels y señala asyncDone.
+	// Main thread hace WritePixels (upload GPU rapido).
+	rawBGRA   []byte         // buffer para copia rapida de BGRA crudo
+	convW     int            // ancho de la conversion en curso
+	convH     int            // alto de la conversion en curso
+	convRow   int            // rowBytes de la conversion en curso
+	asyncWork chan struct{}  // señal: rawBGRA tiene datos nuevos
+	asyncDone chan struct{}  // señal: pixels tiene resultado listo
+	asyncStop chan struct{}  // cerrar goroutine al destruir la vista
+	asyncBusy bool           // true: goroutine procesando, no tocar rawBGRA
 
 	// OnMessage is called when the page sends a message via go.send(msg).
 	// msg is a string or JSON string. Use ParseMessage to get structured data.
@@ -115,40 +138,50 @@ func New(width, height int, htmlPath string, opts *Options) (*UltralightUI, erro
 }
 
 func newUI(width, height int, html []byte) (*UltralightUI, error) {
-	viewID := ulCreateView(int32(width), int32(height))
+	// Combined create+load in ONE worker roundtrip, no sleeping
+	viewID := ulCreateViewWithHTML(int32(width), int32(height), string(html))
 	if viewID < 0 {
-		return nil, fmt.Errorf("ul_create_view failed with code %d", viewID)
+		return nil, fmt.Errorf("ul_create_view_with_html failed with code %d", viewID)
 	}
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:  viewID,
-		texture: ebiten.NewImage(width, height),
-		pixels:  make([]byte, width*height*4),
-		width:   width,
-		height:  height,
+		viewID:         viewID,
+		texture:        ebiten.NewImage(width, height),
+		pixels:         make([]byte, width*height*4),
+		width:          width,
+		height:         height,
+		dirtyCountdown: 120, // ~2s a 60fps para carga inicial
+		rawBGRA:        make([]byte, width*height*4),
+		asyncWork:      make(chan struct{}, 1),
+		asyncDone:      make(chan struct{}, 1),
+		asyncStop:      make(chan struct{}),
 	}
-	if len(html) > 0 {
-		ulViewLoadHTML(viewID, string(html))
-	}
+	go ui.asyncConvertLoop()
 	return ui, nil
 }
 
 func newUIWithURL(width, height int, url string) (*UltralightUI, error) {
-	viewID := ulCreateView(int32(width), int32(height))
+	// Combined create+load in ONE worker roundtrip, no sleeping
+	viewID := ulCreateViewWithURL(int32(width), int32(height), url)
 	if viewID < 0 {
-		return nil, fmt.Errorf("ul_create_view failed with code %d", viewID)
+		return nil, fmt.Errorf("ul_create_view_with_url failed with code %d", viewID)
 	}
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:  viewID,
-		texture: ebiten.NewImage(width, height),
-		pixels:  make([]byte, width*height*4),
-		width:   width,
-		height:  height,
+		viewID:         viewID,
+		texture:        ebiten.NewImage(width, height),
+		pixels:         make([]byte, width*height*4),
+		width:          width,
+		height:         height,
+		dirtyCountdown: 120, // ~2s a 60fps para carga inicial
+		rawBGRA:        make([]byte, width*height*4),
+		asyncWork:      make(chan struct{}, 1),
+		asyncDone:      make(chan struct{}, 1),
+		asyncStop:      make(chan struct{}),
 	}
-	ulViewLoadURL(viewID, url)
+	go ui.asyncConvertLoop()
 	return ui, nil
 }
 
@@ -184,6 +217,17 @@ func (ui *UltralightUI) SetBounds(x, y, w, h int) {
 	ui.BoundsX, ui.BoundsY, ui.BoundsW, ui.BoundsH = x, y, w, h
 }
 
+// markDirty señala que el contenido visual cambió. Activa la copia de pixels
+// durante los proximos frames para capturar la actualizacion y transiciones CSS.
+func (ui *UltralightUI) markDirty() {
+	ui.dirtyCountdown = 30 // ~500ms a 60fps, cubre transiciones CSS tipicas
+}
+
+// MarkDirty señala externamente que el contenido visual cambió.
+func (ui *UltralightUI) MarkDirty() {
+	ui.markDirty()
+}
+
 // injectGoHelper ensures the window.go namespace is set up. The native __goSend
 // function is registered by the C bridge via JavaScriptCore. This ensures
 // go.send wraps it with JSON serialization for non-string values.
@@ -191,15 +235,43 @@ func (ui *UltralightUI) injectGoHelper() {
 	ui.Eval("if(typeof window.__goSend==='function'){window.go=window.go||{};if(!window.go.send)window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};}")
 }
 
+// Tick calls the Ultralight renderer once (Update + RefreshDisplay + Render for all views).
+// When using multiple views, call Tick() once per frame BEFORE calling UpdateNoTick() on each view.
+// This avoids redundant renderer cycles that happen when each view calls Update().
+func Tick() {
+	ulTick()
+}
+
 // Update should be called every frame from the game's Update. It ticks Ultralight,
 // copies pixels to the texture, polls messages, and forwards input.
+// Note: each call to Update() triggers a full renderer cycle for ALL views.
+// For multiple views, prefer calling Tick() once then UpdateNoTick() on each view.
 func (ui *UltralightUI) Update() error {
 	if ui.closed {
 		return nil
 	}
+	ulTick()
+	return ui.updateInternal()
+}
+
+// UpdateNoTick does everything Update() does EXCEPT calling ulTick().
+// Use with Tick(): call Tick() once per frame, then UpdateNoTick() on each view.
+func (ui *UltralightUI) UpdateNoTick() error {
+	if ui.closed {
+		return nil
+	}
+	return ui.updateInternal()
+}
+
+// isHidden returns true if the view has zero-size bounds (hidden via SetBounds(0,0,0,0)).
+func (ui *UltralightUI) isHidden() bool {
+	return ui.BoundsW == 0 && ui.BoundsH == 0 && ui.BoundsX == 0 && ui.BoundsY == 0
+}
+
+func (ui *UltralightUI) updateInternal() error {
 	ui.frameCount++
 
-	// Poll native messages (JS -> Go via go.send)
+	// Poll native messages (JS -> Go via go.send) — siempre, incluso oculta
 	for {
 		msg, ok := pollMessage(ui.viewID)
 		if !ok {
@@ -210,9 +282,7 @@ func (ui *UltralightUI) Update() error {
 		}
 	}
 
-	ulTick()
-
-	if !ui.domReady && ui.frameCount > 30 {
+	if !ui.domReady && ui.frameCount > 10 && ui.IsReady() {
 		ui.domReady = true
 	}
 
@@ -221,11 +291,36 @@ func (ui *UltralightUI) Update() error {
 		ui.goHelperInjected = true
 	}
 
+	// Vista oculta: solo drenar mensajes, no procesar input ni copiar pixels
+	if ui.isHidden() {
+		return nil
+	}
+
 	if ui.domReady {
 		ui.forwardInput()
 	}
 
-	ui.copyPixels()
+	// Pipeline async de pixels: solo cuando hay cambios visuales pendientes
+	if ui.dirtyCountdown > 0 {
+		// Recoger resultado del goroutine background si hay
+		select {
+		case <-ui.asyncDone:
+			ui.texture.WritePixels(ui.pixels)
+			ui.dirtyCountdown--
+			ui.asyncBusy = false
+		default:
+		}
+		// Iniciar nueva copia si el goroutine no esta ocupado
+		if !ui.asyncBusy {
+			if ui.grabRawPixels() {
+				select {
+				case ui.asyncWork <- struct{}{}:
+					ui.asyncBusy = true
+				default:
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -256,31 +351,40 @@ func (ui *UltralightUI) forwardInput() {
 			ulViewFireMouse(ui.viewID, mouseEventTypeMoved, int32(lx), int32(ly), mouseButtonNone)
 			ui.mouseX = lx
 			ui.mouseY = ly
+			// Refrescar textura brevemente para capturar hover CSS (~167ms cubre transiciones de 150ms)
+			if ui.dirtyCountdown < 10 {
+				ui.dirtyCountdown = 10
+			}
 		}
 
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
 			if !ui.leftDown {
 				ui.leftDown = true
 				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonLeft)
+				ui.markDirty()
 			}
 		} else if ui.leftDown {
 			ui.leftDown = false
 			ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonLeft)
+			ui.markDirty()
 		}
 
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonRight) {
 			if !ui.rightDown {
 				ui.rightDown = true
 				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonRight)
+				ui.markDirty()
 			}
 		} else if ui.rightDown {
 			ui.rightDown = false
 			ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonRight)
+			ui.markDirty()
 		}
 
 		_, scrollY := ebiten.Wheel()
 		if scrollY != 0 {
 			ulViewFireScroll(ui.viewID, scrollEventTypeByPixel, 0, int32(scrollY*100))
+			ui.markDirty()
 		}
 	}
 
@@ -290,23 +394,30 @@ func (ui *UltralightUI) forwardInput() {
 }
 
 func (ui *UltralightUI) forwardKeyboard() {
+	dirty := false
 	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X/A)
 	for _, key := range inpututil.AppendJustPressedKeys(nil) {
 		vk, mods := keyToVK(key)
 		if vk != 0 {
 			ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, "")
+			dirty = true
 		}
 	}
 	// Character input from OS text input system (handles shift, layout, IME correctly)
 	for _, r := range ebiten.AppendInputChars(nil) {
 		ulViewFireKey(ui.viewID, keyEventChar, 0, 0, string(r))
+		dirty = true
 	}
 	// Key up events
 	for _, key := range inpututil.AppendJustReleasedKeys(nil) {
 		vk, mods := keyToVK(key)
 		if vk != 0 {
 			ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, "")
+			dirty = true
 		}
+	}
+	if dirty {
+		ui.markDirty()
 	}
 }
 
@@ -468,10 +579,12 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 	}
 }
 
-func (ui *UltralightUI) copyPixels() {
+// grabRawPixels copia los bytes BGRA crudos de Ultralight a rawBGRA (main thread).
+// Usa copy() (memcpy nativo) para minimizar el tiempo con el pixel lock retenido.
+func (ui *UltralightUI) grabRawPixels() bool {
 	ptr := ulViewGetPixels(ui.viewID)
 	if ptr == 0 {
-		return
+		return false
 	}
 
 	w := ulViewGetWidth(ui.viewID)
@@ -480,27 +593,50 @@ func (ui *UltralightUI) copyPixels() {
 
 	if w == 0 || h == 0 {
 		ulViewUnlockPixels(ui.viewID)
-		return
+		return false
 	}
 
-	totalBytes := uintptr(rowBytes) * uintptr(h)
+	totalBytes := int(rowBytes) * int(h)
 	src := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), totalBytes)
 
-	dstIdx := 0
-	for y := 0; y < int(h); y++ {
-		srcRowStart := y * int(rowBytes)
-		for x := 0; x < int(w); x++ {
-			srcOff := srcRowStart + x*4
-			ui.pixels[dstIdx+0] = src[srcOff+2] // BGRA -> RGBA
-			ui.pixels[dstIdx+1] = src[srcOff+1]
-			ui.pixels[dstIdx+2] = src[srcOff+0]
-			ui.pixels[dstIdx+3] = src[srcOff+3]
-			dstIdx += 4
+	// Asegurar que rawBGRA tiene capacidad suficiente (rowBytes puede tener padding)
+	if totalBytes > len(ui.rawBGRA) {
+		ui.rawBGRA = make([]byte, totalBytes)
+	}
+	copy(ui.rawBGRA[:totalBytes], src)
+	ulViewUnlockPixels(ui.viewID)
+
+	ui.convW = int(w)
+	ui.convH = int(h)
+	ui.convRow = int(rowBytes)
+	return true
+}
+
+// asyncConvertLoop corre en un goroutine separado. Convierte BGRA→RGBA sin bloquear el game loop.
+func (ui *UltralightUI) asyncConvertLoop() {
+	for {
+		select {
+		case <-ui.asyncStop:
+			return
+		case <-ui.asyncWork:
+			w, h, rowBytes := ui.convW, ui.convH, ui.convRow
+			dstIdx := 0
+			for y := 0; y < h; y++ {
+				srcRow := ui.rawBGRA[y*rowBytes : y*rowBytes+w*4]
+				for x := 0; x < w*4; x += 4 {
+					ui.pixels[dstIdx+0] = srcRow[x+2] // BGRA -> RGBA
+					ui.pixels[dstIdx+1] = srcRow[x+1]
+					ui.pixels[dstIdx+2] = srcRow[x+0]
+					ui.pixels[dstIdx+3] = srcRow[x+3]
+					dstIdx += 4
+				}
+			}
+			select {
+			case ui.asyncDone <- struct{}{}:
+			default:
+			}
 		}
 	}
-
-	ulViewUnlockPixels(ui.viewID)
-	ui.texture.WritePixels(ui.pixels)
 }
 
 // GetTexture returns the Ebiten image with the current HTML content rendered.
@@ -514,6 +650,7 @@ func (ui *UltralightUI) Eval(script string) {
 		return
 	}
 	evalJS(ui.viewID, script)
+	ui.markDirty()
 }
 
 // ParseMessage parses msg as JSON if it looks like JSON (starts with '{' or '[').
@@ -562,7 +699,18 @@ func (ui *UltralightUI) Send(data interface{}) error {
 	}
 	sb.WriteString("\"));")
 	evalJS(ui.viewID, sb.String())
+	ui.markDirty()
 	return nil
+}
+
+// IsReady returns true if the view has finished async loading and is usable.
+// For synchronously created views this always returns true.
+// For async views (NewFromFSAsync), it returns false until priming+loading is done.
+func (ui *UltralightUI) IsReady() bool {
+	if ui.closed {
+		return false
+	}
+	return ulViewIsReady(ui.viewID) != 0
 }
 
 // Close releases resources. Call when done (e.g. defer ui.Close()).
@@ -572,6 +720,8 @@ func (ui *UltralightUI) Close() {
 		return
 	}
 	ui.closed = true
+	// Detener goroutine de conversion async
+	close(ui.asyncStop)
 	if getFocusedViewID() == ui.viewID {
 		setFocusedViewID(-1)
 	}

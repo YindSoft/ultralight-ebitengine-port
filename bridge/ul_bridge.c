@@ -114,6 +114,8 @@ typedef unsigned int  (*PFN_ulSurfaceGetWidth)(ULSurface);
 typedef unsigned int  (*PFN_ulSurfaceGetHeight)(ULSurface);
 typedef unsigned int  (*PFN_ulSurfaceGetRowBytes)(ULSurface);
 typedef void          (*PFN_ulSurfaceClearDirtyBounds)(ULSurface);
+typedef struct { int left, top, right, bottom; } ULIntRect;
+typedef ULIntRect     (*PFN_ulSurfaceGetDirtyBounds)(ULSurface);
 typedef const char*   (*PFN_ulVersionString)(void);
 typedef void (*PFN_ulEnablePlatformFontLoader)(void);
 typedef void (*PFN_ulEnablePlatformFileSystem)(ULString);
@@ -213,6 +215,7 @@ static PFN_ulSurfaceGetWidth           pfn_SurfaceGetWidth;
 static PFN_ulSurfaceGetHeight          pfn_SurfaceGetHeight;
 static PFN_ulSurfaceGetRowBytes        pfn_SurfaceGetRowBytes;
 static PFN_ulSurfaceClearDirtyBounds   pfn_SurfaceClearDirtyBounds;
+static PFN_ulSurfaceGetDirtyBounds    pfn_SurfaceGetDirtyBounds;
 static PFN_ulVersionString             pfn_VersionString;
 static PFN_ulEnablePlatformFontLoader  pfn_EnablePlatformFontLoader;
 static PFN_ulEnablePlatformFileSystem  pfn_EnablePlatformFileSystem;
@@ -239,13 +242,13 @@ static PFN_JSValueToStringCopy                 pfn_JSValueToStringCopy;
 #define CONSOLE_MSG_MAX    64
 #define CONSOLE_MSG_BUFLEN 2048
 #define MSG_QUEUE_MAX      64
-#define MSG_QUEUE_BUFLEN   2048
+#define MSG_QUEUE_BUFLEN   8192
 #define MOUSE_QUEUE_MAX    64
 #define SCROLL_QUEUE_MAX   16
 #define KEY_QUEUE_MAX      32
 #define KEY_TEXT_LEN       32
 #define JS_QUEUE_MAX       32
-#define JS_QUEUE_BUFLEN    1024
+#define JS_QUEUE_BUFLEN    8192
 
 typedef struct { int type, x, y, button; } MouseQueueEntry;
 typedef struct { int type, dx, dy; } ScrollQueueEntry;
@@ -276,6 +279,12 @@ typedef struct {
     int       msg_head;
     int       msg_tail;
     int       msg_count;
+    /* Async loading state: 0=ready, 1=priming, 2=post_load */
+    int       load_phase;
+    int       phase_counter;
+    char*     pending_load_str;   /* URL or HTML to load after priming (strdup'd) */
+    bool      pending_is_url;
+    bool      js_bound;           /* true if setup_js_bindings completed successfully */
 } ViewSlot;
 
 static ULRenderer g_renderer = NULL;
@@ -315,7 +324,10 @@ enum CmdType {
     CMD_LOAD_HTML,
     CMD_LOAD_URL,
     CMD_TICK,
-    CMD_QUIT
+    CMD_QUIT,
+    CMD_CREATE_AND_LOAD,  /* Async: crea view + inicia carga diferida */
+    CMD_CREATE_WITH_HTML, /* Sync: create + load HTML in one shot, no sleeping */
+    CMD_CREATE_WITH_URL   /* Sync: create + load URL in one shot, no sleeping */
 };
 
 /* ── Worker thread synchronization ────────────────────────────────── */
@@ -340,15 +352,6 @@ static volatile int g_cmd_int2 = 0;  /* height */
 static volatile int g_cmd_result = 0;
 static char g_init_base_dir[PATHBUF_SIZE];
 static volatile int g_debug = 0;
-
-/* ── Cross-platform sleep ───────────────────────────────────────────── */
-static void msleep(int ms) {
-#ifdef _WIN32
-    Sleep(ms);
-#else
-    usleep(ms * 1000);
-#endif
-}
 
 /* ── VFS (Virtual File System) ────────────────────────────────────────── */
 #define VFS_MAX_FILES 256
@@ -644,6 +647,7 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_SurfaceGetHeight, "ulSurfaceGetHeight");
     RESOLVE(g_hUltralight, pfn_SurfaceGetRowBytes, "ulSurfaceGetRowBytes");
     RESOLVE(g_hUltralight, pfn_SurfaceClearDirtyBounds, "ulSurfaceClearDirtyBounds");
+    RESOLVE(g_hUltralight, pfn_SurfaceGetDirtyBounds, "ulSurfaceGetDirtyBounds");
     RESOLVE(g_hUltralight, pfn_VersionString, "ulVersionString");
     RESOLVE(g_hAppCore, pfn_EnablePlatformFontLoader, "ulEnablePlatformFontLoader");
     RESOLVE(g_hAppCore, pfn_EnablePlatformFileSystem, "ulEnablePlatformFileSystem");
@@ -710,13 +714,14 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
 }
 
 /* Register window.__goSend and window.go.send as native JSC functions.
- * Must be called on the worker thread when the JS context is ready. */
-static void setup_js_bindings(int vid) {
-    if (vid < 0 || vid >= MAX_VIEWS || !g_views[vid].used) return;
+ * Must be called on the worker thread when the JS context is ready.
+ * Returns true if bindings were set up, false if context not ready. */
+static bool setup_js_bindings(int vid) {
+    if (vid < 0 || vid >= MAX_VIEWS || !g_views[vid].used) return false;
     ViewSlot* v = &g_views[vid];
 
     JSContextRef ctx = pfn_ViewLockJSContext(v->view);
-    if (!ctx) return;
+    if (!ctx) return false;
 
     JSObjectRef global = pfn_JSContextGetGlobalObject(ctx);
 
@@ -732,7 +737,9 @@ static void setup_js_bindings(int vid) {
     ULString goNs = pfn_CreateString("window.go=window.go||{};window.go.send=window.__goSend;");
     pfn_ViewEvaluateScript(v->view, goNs, NULL);
     pfn_DestroyString(goNs);
+    v->js_bound = true;
     blog("setup_js_bindings: vid=%d done", vid);
+    return true;
 }
 
 static int worker_do_init(void) {
@@ -802,16 +809,15 @@ static int worker_do_create_view(int width, int height) {
     v->width = width;
     v->height = height;
     v->used = true;
+    v->js_bound = false;
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
     pfn_ViewFocus(v->view);
     g_view_count++;
-    for (int i = 0; i < 8; i++) {
-        pfn_Update(g_renderer);
-        msleep(10);
-    }
+    /* Single update cycle, no sleeping — pfn_Update processes synchronously */
+    pfn_Update(g_renderer);
     pfn_Render(g_renderer);
     setup_js_bindings(vid);
     blog("worker_do_create_view: vid=%d", vid);
@@ -824,6 +830,9 @@ static void worker_do_destroy_view(int vid) {
     if (v->view) { pfn_DestroyView(v->view); v->view = NULL; }
     v->surface = NULL;
     v->used = false;
+    v->js_bound = false;
+    v->load_phase = 0;
+    if (v->pending_load_str) { free(v->pending_load_str); v->pending_load_str = NULL; }
     g_view_count--;
 }
 
@@ -834,19 +843,130 @@ static void worker_do_load(int vid, const char* str, bool is_url) {
     if (is_url) pfn_ViewLoadURL(view, s);
     else        pfn_ViewLoadHTML(view, s);
     pfn_DestroyString(s);
-    for (int i = 0; i < 20; i++) {
+    /* A few updates to process the load, no sleeping */
+    for (int i = 0; i < 3; i++)
         pfn_Update(g_renderer);
-        msleep(10);
-    }
+    pfn_RefreshDisplay(g_renderer, 0);
     pfn_Render(g_renderer);
     /* Re-register JSC bindings (page load resets the JS context) */
     setup_js_bindings(vid);
 }
 
+/* Async create: crea la view sin loops de priming, guarda URL/HTML para carga diferida.
+ * La carga real ocurre progresivamente en worker_do_tick. Retorna view_id inmediatamente. */
+static int worker_do_create_and_load(int width, int height, const char* str, bool is_url) {
+    int vid;
+    for (vid = 0; vid < MAX_VIEWS; vid++)
+        if (!g_views[vid].used) break;
+    if (vid >= MAX_VIEWS) { blog("worker_do_create_and_load: no slot"); return -1; }
+    ViewSlot* v = &g_views[vid];
+    ULViewConfig vc = pfn_CreateViewConfig();
+    pfn_VCSetIsAccelerated(vc, false);
+    pfn_VCSetIsTransparent(vc, true);
+    pfn_VCSetInitialDeviceScale(vc, 1.0);
+    v->view = pfn_CreateView(g_renderer, (unsigned int)width, (unsigned int)height, vc, NULL);
+    pfn_DestroyViewConfig(vc);
+    if (!v->view) { blog("worker_do_create_and_load: view NULL"); return -11; }
+    v->surface = pfn_ViewGetSurface(v->view);
+    v->width = width;
+    v->height = height;
+    v->used = true;
+    v->js_bound = false;
+    v->console_head = v->console_tail = v->console_count = 0;
+    v->msg_head = v->msg_tail = v->msg_count = 0;
+    v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
+    pfn_ViewFocus(v->view);
+    g_view_count++;
+    /* Guardar contenido para carga diferida */
+    v->pending_load_str = strdup(str);
+    v->pending_is_url = is_url;
+    v->load_phase = 1; /* priming */
+    v->phase_counter = 0;
+    blog("worker_do_create_and_load: vid=%d (async)", vid);
+    return vid;
+}
+
+/* Fast sync create + load: single worker roundtrip, no sleeping.
+ * Combines view creation and content loading into one operation. */
+static int worker_do_create_with_content(int width, int height, const char* content, bool is_url) {
+    int vid;
+    for (vid = 0; vid < MAX_VIEWS; vid++)
+        if (!g_views[vid].used) break;
+    if (vid >= MAX_VIEWS) { blog("worker_do_create_with_content: no slot"); return -1; }
+    ViewSlot* v = &g_views[vid];
+    ULViewConfig vc = pfn_CreateViewConfig();
+    pfn_VCSetIsAccelerated(vc, false);
+    pfn_VCSetIsTransparent(vc, true);
+    pfn_VCSetInitialDeviceScale(vc, 1.0);
+    v->view = pfn_CreateView(g_renderer, (unsigned int)width, (unsigned int)height, vc, NULL);
+    pfn_DestroyViewConfig(vc);
+    if (!v->view) { blog("worker_do_create_with_content: view NULL"); return -11; }
+    v->surface = pfn_ViewGetSurface(v->view);
+    v->width = width;
+    v->height = height;
+    v->used = true;
+    v->js_bound = false;
+    v->console_head = v->console_tail = v->console_count = 0;
+    v->msg_head = v->msg_tail = v->msg_count = 0;
+    v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->load_phase = 0;
+    v->phase_counter = 0;
+    v->pending_load_str = NULL;
+    pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
+    pfn_ViewFocus(v->view);
+    g_view_count++;
+    /* Load content immediately */
+    if (content && content[0]) {
+        ULString s = pfn_CreateString(content);
+        if (is_url) pfn_ViewLoadURL(v->view, s);
+        else        pfn_ViewLoadHTML(v->view, s);
+        pfn_DestroyString(s);
+    }
+    /* Minimal processing: one update to kick off parsing.
+     * Render is deferred to the next ul_tick() call for maximum speed.
+     * JS bindings are set up after the update so the context is ready. */
+    pfn_Update(g_renderer);
+    setup_js_bindings(vid);
+    blog("worker_do_create_with_content: vid=%d", vid);
+    return vid;
+}
+
 static void worker_do_tick(void) {
+    /* Procesar vistas en carga asincronica */
+    for (int vid = 0; vid < MAX_VIEWS; vid++) {
+        ViewSlot* v = &g_views[vid];
+        if (!v->used || v->load_phase == 0) continue;
+        v->phase_counter++;
+        if (v->load_phase == 1 && v->phase_counter >= 2) {
+            /* Priming completado: cargar contenido */
+            pfn_Render(g_renderer);
+            if (v->pending_load_str) {
+                ULString s = pfn_CreateString(v->pending_load_str);
+                if (v->pending_is_url) pfn_ViewLoadURL(v->view, s);
+                else                   pfn_ViewLoadHTML(v->view, s);
+                pfn_DestroyString(s);
+                free(v->pending_load_str);
+                v->pending_load_str = NULL;
+            }
+            v->load_phase = 2; /* post-load */
+            v->phase_counter = 0;
+            blog("async view %d: priming done, loading content", vid);
+        } else if (v->load_phase == 2 && v->phase_counter >= 3) {
+            /* Post-load completado: setup JS bindings */
+            pfn_Render(g_renderer);
+            setup_js_bindings(vid);
+            v->load_phase = 0; /* ready */
+            blog("async view %d: ready", vid);
+        }
+    }
+
     for (int vid = 0; vid < MAX_VIEWS; vid++) {
         ViewSlot* v = &g_views[vid];
         if (!v->used || !v->view) continue;
+        /* Retry JS bindings if they weren't set up during fast creation */
+        if (!v->js_bound && v->load_phase == 0)
+            setup_js_bindings(vid);
         for (int i = 0; i < v->mouse_count; i++) {
             MouseQueueEntry* e = &v->mouse_queue[i];
             int x = e->x, y = e->y;
@@ -924,6 +1044,15 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
         case CMD_LOAD_URL:
             worker_do_load(g_cmd_int1, g_cmd_str_arg, true);
             break;
+        case CMD_CREATE_AND_LOAD:
+            g_cmd_result = worker_do_create_and_load(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            break;
+        case CMD_CREATE_WITH_HTML:
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, false);
+            break;
+        case CMD_CREATE_WITH_URL:
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            break;
         case CMD_TICK:
             worker_do_tick();
             break;
@@ -983,6 +1112,15 @@ static void* worker_thread_proc(void* param) {
             break;
         case CMD_LOAD_URL:
             worker_do_load(g_cmd_int1, g_cmd_str_arg, true);
+            break;
+        case CMD_CREATE_AND_LOAD:
+            g_cmd_result = worker_do_create_and_load(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            break;
+        case CMD_CREATE_WITH_HTML:
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, false);
+            break;
+        case CMD_CREATE_WITH_URL:
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
             break;
         case CMD_TICK:
             worker_do_tick();
@@ -1136,6 +1274,50 @@ EXPORT void ul_view_load_url(int view_id, const char* url) {
     send_cmd(CMD_LOAD_URL, url, view_id, 0);
 }
 
+/* Async create + load URL: crea la view y programa la carga sin bloquear.
+ * La carga real se procesa progresivamente en ul_tick.
+ * Retorna view_id (>= 0) inmediatamente, o negativo si error.
+ * Usar ul_view_is_ready para saber cuando esta lista. */
+EXPORT int ul_create_view_async(int width, int height, const char* url) {
+#ifdef _WIN32
+    if (!url || !g_worker_thread) return -1;
+#else
+    if (!url || !g_worker_started) return -1;
+#endif
+    send_cmd(CMD_CREATE_AND_LOAD, url, width, height);
+    return g_cmd_result;
+}
+
+/* Fast sync create + load HTML: one worker roundtrip, no sleeping.
+ * Retorna view_id (>= 0) o negativo si error. */
+EXPORT int ul_create_view_with_html(int width, int height, const char* html) {
+#ifdef _WIN32
+    if (!g_worker_thread) return -1;
+#else
+    if (!g_worker_started) return -1;
+#endif
+    send_cmd(CMD_CREATE_WITH_HTML, html ? html : "", width, height);
+    return g_cmd_result;
+}
+
+/* Fast sync create + load URL: one worker roundtrip, no sleeping.
+ * Retorna view_id (>= 0) o negativo si error. */
+EXPORT int ul_create_view_with_url(int width, int height, const char* url) {
+#ifdef _WIN32
+    if (!url || !g_worker_thread) return -1;
+#else
+    if (!url || !g_worker_started) return -1;
+#endif
+    send_cmd(CMD_CREATE_WITH_URL, url, width, height);
+    return g_cmd_result;
+}
+
+/* Devuelve 1 si la view esta lista (carga async completada), 0 si no. */
+EXPORT int ul_view_is_ready(int view_id) {
+    if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return 0;
+    return g_views[view_id].load_phase == 0 ? 1 : 0;
+}
+
 EXPORT void ul_tick(void) {
 #ifdef _WIN32
     if (!g_worker_thread) return;
@@ -1169,6 +1351,42 @@ EXPORT unsigned int ul_view_get_height(int view_id) {
 EXPORT unsigned int ul_view_get_row_bytes(int view_id) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !g_views[view_id].surface) return 0;
     return pfn_SurfaceGetRowBytes(g_views[view_id].surface);
+}
+
+/* Copia pixels BGRA->RGBA al buffer destino solo si la superficie cambio.
+ * Retorna 1 si se copiaron pixels (dirty), 0 si no hubo cambios. */
+EXPORT int ul_view_copy_pixels_rgba(int view_id, unsigned char* dest, int dest_size) {
+    if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !g_views[view_id].surface) return 0;
+    ViewSlot* v = &g_views[view_id];
+    /* Verificar si la superficie tiene cambios */
+    ULIntRect dirty = pfn_SurfaceGetDirtyBounds(v->surface);
+    if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) return 0;
+    unsigned char* src = (unsigned char*)pfn_SurfaceLockPixels(v->surface);
+    if (!src) return 0;
+    int w = v->width;
+    int h = v->height;
+    unsigned int rowBytes = pfn_SurfaceGetRowBytes(v->surface);
+    int needed = w * h * 4;
+    if (dest_size < needed) {
+        pfn_SurfaceUnlockPixels(v->surface);
+        return 0;
+    }
+    /* Conversion BGRA -> RGBA en C (mucho mas rapido que Go) */
+    int dstIdx = 0;
+    for (int y = 0; y < h; y++) {
+        unsigned char* row = src + y * rowBytes;
+        for (int x = 0; x < w; x++) {
+            int off = x * 4;
+            dest[dstIdx+0] = row[off+2];
+            dest[dstIdx+1] = row[off+1];
+            dest[dstIdx+2] = row[off+0];
+            dest[dstIdx+3] = row[off+3];
+            dstIdx += 4;
+        }
+    }
+    pfn_SurfaceUnlockPixels(v->surface);
+    pfn_SurfaceClearDirtyBounds(v->surface);
+    return 1;
 }
 
 EXPORT void ul_view_fire_mouse(int view_id, int type, int x, int y, int button) {

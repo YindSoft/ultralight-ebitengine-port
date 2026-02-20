@@ -79,25 +79,90 @@ func NewFromFS(width, height int, mainFile string, fsys fs.FS, opts *Options) (*
 		return nil, fmt.Errorf("walking FS: %w", err)
 	}
 
-	// Create view and load via file:/// URL
-	viewID := ulCreateView(int32(width), int32(height))
+	norm := path.Clean(strings.ReplaceAll(mainFile, "\\", "/"))
+	norm = strings.TrimLeft(norm, "/")
+	url := "file:///" + norm
+
+	// Combined create+load in ONE worker roundtrip, no sleeping
+	viewID := ulCreateViewWithURL(int32(width), int32(height), url)
 	if viewID < 0 {
-		return nil, fmt.Errorf("ul_create_view failed with code %d", viewID)
+		return nil, fmt.Errorf("ul_create_view_with_url failed with code %d", viewID)
 	}
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:  viewID,
-		texture: ebiten.NewImage(width, height),
-		pixels:  make([]byte, width*height*4),
-		width:   width,
-		height:  height,
+		viewID:         viewID,
+		texture:        ebiten.NewImage(width, height),
+		pixels:         make([]byte, width*height*4),
+		width:          width,
+		height:         height,
+		dirtyCountdown: 120,
+		rawBGRA:        make([]byte, width*height*4),
+		asyncWork:      make(chan struct{}, 1),
+		asyncDone:      make(chan struct{}, 1),
+		asyncStop:      make(chan struct{}),
+	}
+	go ui.asyncConvertLoop()
+
+	return ui, nil
+}
+
+// NewFromFSAsync is like NewFromFS but creates the view asynchronously.
+// The view is returned immediately but is not yet ready to use.
+// Call IsReady() to check when loading is complete (~5 ticks / ~83ms).
+// Update() can be called immediately; it handles the async state gracefully.
+// Pixel output will be empty/transparent until the view is ready.
+func NewFromFSAsync(width, height int, mainFile string, fsys fs.FS, opts *Options) (*UltralightUI, error) {
+	baseDir, debug := resolveOpts(opts)
+	if err := initBridge(baseDir); err != nil {
+		return nil, fmt.Errorf("bridge: %w", err)
+	}
+	if err := ensureULInit(baseDir, debug); err != nil {
+		return nil, err
+	}
+
+	// Walk the FS and register each file
+	err := fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, readErr := fs.ReadFile(fsys, p)
+		if readErr != nil {
+			return fmt.Errorf("reading %s: %w", p, readErr)
+		}
+		return RegisterFile(p, data)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walking FS: %w", err)
 	}
 
 	norm := path.Clean(strings.ReplaceAll(mainFile, "\\", "/"))
 	norm = strings.TrimLeft(norm, "/")
 	url := "file:///" + norm
-	ulViewLoadURL(viewID, url)
+
+	// Crear view asincronica: retorna inmediatamente, carga se procesa en ticks
+	viewID := ulCreateViewAsync(int32(width), int32(height), url)
+	if viewID < 0 {
+		return nil, fmt.Errorf("ul_create_view_async failed with code %d", viewID)
+	}
+	registerView()
+
+	ui := &UltralightUI{
+		viewID:         viewID,
+		texture:        ebiten.NewImage(width, height),
+		pixels:         make([]byte, width*height*4),
+		width:          width,
+		height:         height,
+		dirtyCountdown: 120,
+		rawBGRA:        make([]byte, width*height*4),
+		asyncWork:      make(chan struct{}, 1),
+		asyncDone:      make(chan struct{}, 1),
+		asyncStop:      make(chan struct{}),
+	}
+	go ui.asyncConvertLoop()
 
 	return ui, nil
 }
