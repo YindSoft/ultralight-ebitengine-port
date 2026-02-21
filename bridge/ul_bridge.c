@@ -162,6 +162,7 @@ typedef JSContextRef (*PFN_ulViewLockJSContext)(ULView);
 typedef void         (*PFN_ulViewUnlockJSContext)(ULView);
 
 /* JavaScriptCore C API (exported from WebCore) */
+typedef JSContextRef (*PFN_JSContextGetGlobalContext)(JSContextRef);
 typedef JSObjectRef  (*PFN_JSContextGetGlobalObject)(JSContextRef);
 typedef JSStringRef  (*PFN_JSStringCreateWithUTF8CString)(const char*);
 typedef void         (*PFN_JSStringRelease)(JSStringRef);
@@ -227,6 +228,7 @@ static PFN_ulPlatformSetClipboard      pfn_PlatformSetClipboard;
 static PFN_ulStringAssignCString       pfn_StringAssignCString;
 static PFN_ulViewLockJSContext         pfn_ViewLockJSContext;
 static PFN_ulViewUnlockJSContext       pfn_ViewUnlockJSContext;
+static PFN_JSContextGetGlobalContext            pfn_JSContextGetGlobalContext;
 static PFN_JSContextGetGlobalObject            pfn_JSContextGetGlobalObject;
 static PFN_JSStringCreateWithUTF8CString       pfn_JSStringCreateWithUTF8CString;
 static PFN_JSStringRelease                     pfn_JSStringRelease;
@@ -285,6 +287,7 @@ typedef struct {
     char*     pending_load_str;   /* URL or HTML to load after priming (strdup'd) */
     bool      pending_is_url;
     bool      js_bound;           /* true if setup_js_bindings completed successfully */
+    JSContextRef cached_ctx;    /* cached JSC context for callback matching */
 } ViewSlot;
 
 static ULRenderer g_renderer = NULL;
@@ -617,7 +620,8 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_CreateRenderer, "ulCreateRenderer");
     RESOLVE(g_hUltralight, pfn_DestroyRenderer, "ulDestroyRenderer");
     RESOLVE(g_hUltralight, pfn_Update, "ulUpdate");
-    RESOLVE(g_hUltralight, pfn_RefreshDisplay, "ulRefreshDisplay");
+    /* Opcional: ulRefreshDisplay no existe en versiones públicas del SDK */
+    *(void**)&pfn_RefreshDisplay = GETSYM(g_hUltralight, "ulRefreshDisplay");
     RESOLVE(g_hUltralight, pfn_Render, "ulRender");
     RESOLVE(g_hUltralight, pfn_CreateViewConfig, "ulCreateViewConfig");
     RESOLVE(g_hUltralight, pfn_DestroyViewConfig, "ulDestroyViewConfig");
@@ -662,6 +666,8 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_ViewUnlockJSContext, "ulViewUnlockJSContext");
     /* JavaScriptCore (WebCore) */
     if (!g_hWebCore) { blog("FAIL: WebCore handle"); return -52; }
+    /* Opcional: JSContextGetGlobalContext normaliza execution ctx -> global ctx (necesario en algunas versiones del SDK) */
+    *(void**)&pfn_JSContextGetGlobalContext = GETSYM(g_hWebCore, "JSContextGetGlobalContext");
     RESOLVE(g_hWebCore, pfn_JSContextGetGlobalObject, "JSContextGetGlobalObject");
     RESOLVE(g_hWebCore, pfn_JSStringCreateWithUTF8CString, "JSStringCreateWithUTF8CString");
     RESOLVE(g_hWebCore, pfn_JSStringRelease, "JSStringRelease");
@@ -680,16 +686,15 @@ static int resolve_functions(void) {
  * Runs on the worker thread. */
 static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     JSObjectRef thisObject, size_t argumentCount, const JSValueRef arguments[], JSValueRef* exception) {
-    /* Find view ID by JSC context */
+    /* Normalizar execution context -> global context para matching */
+    JSContextRef globalCtx = pfn_JSContextGetGlobalContext ? pfn_JSContextGetGlobalContext(ctx) : ctx;
     int vid = -1;
     for (int i = 0; i < MAX_VIEWS; i++) {
-        if (g_views[i].used && g_views[i].view) {
-            JSContextRef vc = pfn_ViewLockJSContext(g_views[i].view);
-            pfn_ViewUnlockJSContext(g_views[i].view);
-            if (vc == ctx) { vid = i; break; }
+        if (g_views[i].used && g_views[i].view && g_views[i].cached_ctx == globalCtx) {
+            vid = i; break;
         }
     }
-    if (vid < 0) { blog("jsc_goSend_callback: no matching view for ctx"); return NULL; }
+    if (vid < 0) { blog("jsc_goSend_callback: no matching view for ctx=%p global=%p", (void*)ctx, (void*)globalCtx); return NULL; }
     if (argumentCount < 1) { blog("jsc_goSend_callback: no args"); return NULL; }
 
     /* Convert first argument to UTF-8 */
@@ -722,6 +727,9 @@ static bool setup_js_bindings(int vid) {
 
     JSContextRef ctx = pfn_ViewLockJSContext(v->view);
     if (!ctx) return false;
+
+    /* Cachear el contexto para matching en el callback */
+    v->cached_ctx = ctx;
 
     JSObjectRef global = pfn_JSContextGetGlobalObject(ctx);
 
@@ -846,7 +854,7 @@ static void worker_do_load(int vid, const char* str, bool is_url) {
     /* A few updates to process the load, no sleeping */
     for (int i = 0; i < 3; i++)
         pfn_Update(g_renderer);
-    pfn_RefreshDisplay(g_renderer, 0);
+    if (pfn_RefreshDisplay) pfn_RefreshDisplay(g_renderer, 0);
     pfn_Render(g_renderer);
     /* Re-register JSC bindings (page load resets the JS context) */
     setup_js_bindings(vid);
@@ -1006,7 +1014,7 @@ static void worker_do_tick(void) {
         v->js_count = 0;
     }
     pfn_Update(g_renderer);
-    pfn_RefreshDisplay(g_renderer, 0);
+    if (pfn_RefreshDisplay) pfn_RefreshDisplay(g_renderer, 0);
     pfn_Render(g_renderer);
 }
 
