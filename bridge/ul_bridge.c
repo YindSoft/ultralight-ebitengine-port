@@ -1188,17 +1188,23 @@ static int load_sdk_libs(const char* base_dir) {
 
 static int load_sdk_libs(const char* base_dir) {
     char path[PATHBUF_SIZE];
+    /* En macOS usar RTLD_LOCAL para evitar colision con WebCore.framework del sistema */
+#ifdef __APPLE__
+    int dl_flags = RTLD_NOW | RTLD_LOCAL;
+#else
+    int dl_flags = RTLD_NOW | RTLD_GLOBAL;
+#endif
     snprintf(path, PATHBUF_SIZE, "%s/%sUltralightCore%s", base_dir, LIB_PREFIX, LIB_EXT);
-    g_hUltralightCore = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    g_hUltralightCore = dlopen(path, dl_flags);
     if (!g_hUltralightCore) { blog("FAIL: UltralightCore: %s", dlerror()); return -1; }
     snprintf(path, PATHBUF_SIZE, "%s/%sWebCore%s", base_dir, LIB_PREFIX, LIB_EXT);
-    g_hWebCore = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    g_hWebCore = dlopen(path, dl_flags);
     if (!g_hWebCore) { blog("FAIL: WebCore: %s", dlerror()); return -2; }
     snprintf(path, PATHBUF_SIZE, "%s/%sUltralight%s", base_dir, LIB_PREFIX, LIB_EXT);
-    g_hUltralight = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    g_hUltralight = dlopen(path, dl_flags);
     if (!g_hUltralight) { blog("FAIL: Ultralight: %s", dlerror()); return -3; }
     snprintf(path, PATHBUF_SIZE, "%s/%sAppCore%s", base_dir, LIB_PREFIX, LIB_EXT);
-    g_hAppCore = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    g_hAppCore = dlopen(path, dl_flags);
     if (!g_hAppCore) { blog("FAIL: AppCore: %s", dlerror()); return -4; }
     return 0;
 }

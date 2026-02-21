@@ -5,7 +5,8 @@
 *.log
 *.7z
 *.bat
-
+*.so
+*.dylib
 # Ultralight SDK (download separately, see README)
 # Keep the bridge C source but not the compiled DLL
 
