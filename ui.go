@@ -348,7 +348,12 @@ func (ui *UltralightUI) forwardInput() {
 		}
 
 		if lx != ui.mouseX || ly != ui.mouseY {
-			ulViewFireMouse(ui.viewID, mouseEventTypeMoved, int32(lx), int32(ly), mouseButtonNone)
+			// Pass current button state so Ultralight can handle drag-selection in inputs.
+			moveBtn := int32(mouseButtonNone)
+			if ui.leftDown {
+				moveBtn = mouseButtonLeft
+			}
+			ulViewFireMouse(ui.viewID, mouseEventTypeMoved, int32(lx), int32(ly), moveBtn)
 			ui.mouseX = lx
 			ui.mouseY = ly
 			// Refrescar textura brevemente para capturar hover CSS (~167ms cubre transiciones de 150ms)
@@ -393,6 +398,12 @@ func (ui *UltralightUI) forwardInput() {
 	}
 }
 
+// Key repeat timing in frames (at 60fps: delay ~500ms, interval ~33ms).
+const (
+	keyRepeatDelay    = 30 // frames before repeat starts
+	keyRepeatInterval = 2  // frames between repeats
+)
+
 func (ui *UltralightUI) forwardKeyboard() {
 	dirty := false
 	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X/A)
@@ -401,6 +412,17 @@ func (ui *UltralightUI) forwardKeyboard() {
 		if vk != 0 {
 			ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, "")
 			dirty = true
+		}
+	}
+	// Key repeat: re-fire RawKeyDown for held non-character keys (Backspace, Delete, arrows, etc.)
+	for _, key := range heldNonCharKeys {
+		dur := inpututil.KeyPressDuration(key)
+		if dur > keyRepeatDelay && (dur-keyRepeatDelay)%keyRepeatInterval == 0 {
+			vk, mods := keyToVK(key)
+			if vk != 0 {
+				ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, "")
+				dirty = true
+			}
 		}
 	}
 	// Character input from OS text input system (handles shift, layout, IME correctly)
@@ -419,6 +441,24 @@ func (ui *UltralightUI) forwardKeyboard() {
 	if dirty {
 		ui.markDirty()
 	}
+}
+
+// heldNonCharKeys lists keys that need synthetic repeat because the OS text input
+// system (AppendInputChars) does not emit characters for them.
+var heldNonCharKeys = []ebiten.Key{
+	ebiten.KeyBackspace,
+	ebiten.KeyDelete,
+	ebiten.KeyArrowLeft,
+	ebiten.KeyArrowRight,
+	ebiten.KeyArrowUp,
+	ebiten.KeyArrowDown,
+	ebiten.KeyHome,
+	ebiten.KeyEnd,
+	ebiten.KeyPageUp,
+	ebiten.KeyPageDown,
+	ebiten.KeyTab,
+	ebiten.KeyEnter,
+	ebiten.KeyEscape,
 }
 
 func keyToVK(key ebiten.Key) (int32, uint32) {
