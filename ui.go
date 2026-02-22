@@ -406,11 +406,11 @@ const (
 
 func (ui *UltralightUI) forwardKeyboard() {
 	dirty := false
-	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X/A)
+	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X/A/Z)
 	for _, key := range inpututil.AppendJustPressedKeys(nil) {
 		vk, mods := keyToVK(key)
 		if vk != 0 {
-			ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, "")
+			ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, vkToChar(vk))
 			dirty = true
 		}
 	}
@@ -420,27 +420,52 @@ func (ui *UltralightUI) forwardKeyboard() {
 		if dur > keyRepeatDelay && (dur-keyRepeatDelay)%keyRepeatInterval == 0 {
 			vk, mods := keyToVK(key)
 			if vk != 0 {
-				ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, "")
+				ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, vkToChar(vk))
 				dirty = true
 			}
 		}
 	}
 	// Character input from OS text input system (handles shift, layout, IME correctly)
 	for _, r := range ebiten.AppendInputChars(nil) {
-		ulViewFireKey(ui.viewID, keyEventChar, 0, 0, string(r))
-		dirty = true
+		if r >= 0x20 { // filter control characters (Ctrl+letter combos)
+			ulViewFireKey(ui.viewID, keyEventChar, 0, 0, string(r))
+			dirty = true
+		}
 	}
 	// Key up events
 	for _, key := range inpututil.AppendJustReleasedKeys(nil) {
 		vk, mods := keyToVK(key)
 		if vk != 0 {
-			ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, "")
+			ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, vkToChar(vk))
 			dirty = true
 		}
 	}
 	if dirty {
 		ui.markDirty()
 	}
+}
+
+// vkToChar returns the lowercase character for a virtual key code.
+// Ultralight uses the text/unmodified_text fields for matching keyboard shortcuts
+// (e.g., Ctrl+Z needs unmodified_text="z" to match the undo command).
+func vkToChar(vk int32) string {
+	if vk >= 0x41 && vk <= 0x5A { // A-Z → "a"-"z"
+		return string(rune('a' + (vk - 0x41)))
+	}
+	if vk >= 0x30 && vk <= 0x39 { // 0-9
+		return string(rune('0' + (vk - 0x30)))
+	}
+	switch vk {
+	case 0x08:
+		return "\b" // Backspace
+	case 0x09:
+		return "\t" // Tab
+	case 0x0D:
+		return "\r" // Enter
+	case 0x20:
+		return " " // Space
+	}
+	return ""
 }
 
 // heldNonCharKeys lists keys that need synthetic repeat because the OS text input
