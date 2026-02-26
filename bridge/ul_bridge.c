@@ -626,7 +626,7 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_CreateRenderer, "ulCreateRenderer");
     RESOLVE(g_hUltralight, pfn_DestroyRenderer, "ulDestroyRenderer");
     RESOLVE(g_hUltralight, pfn_Update, "ulUpdate");
-    /* Opcional: ulRefreshDisplay no existe en versiones públicas del SDK */
+    /* Optional: ulRefreshDisplay doesn't exist in public SDK versions */
     *(void**)&pfn_RefreshDisplay = GETSYM(g_hUltralight, "ulRefreshDisplay");
     RESOLVE(g_hUltralight, pfn_Render, "ulRender");
     RESOLVE(g_hUltralight, pfn_CreateViewConfig, "ulCreateViewConfig");
@@ -871,7 +871,7 @@ static void worker_do_load(int vid, const char* str, bool is_url) {
 }
 
 /* Async create: crea la view sin loops de priming, guarda URL/HTML para carga diferida.
- * La carga real ocurre progresivamente en worker_do_tick. Retorna view_id inmediatamente. */
+ * The actual loading occurs progressively in worker_do_tick. Returns view_id immediately. */
 static int worker_do_create_and_load(int width, int height, const char* str, bool is_url) {
     int vid;
     for (vid = 0; vid < MAX_VIEWS; vid++)
@@ -951,13 +951,13 @@ static int worker_do_create_with_content(int width, int height, const char* cont
 }
 
 static void worker_do_tick(void) {
-    /* Procesar vistas en carga asincronica */
+    /* Process views in async loading state */
     for (int vid = 0; vid < MAX_VIEWS; vid++) {
         ViewSlot* v = &g_views[vid];
         if (!v->used || v->load_phase == 0) continue;
         v->phase_counter++;
         if (v->load_phase == 1 && v->phase_counter >= 2) {
-            /* Priming completado: cargar contenido */
+            /* Priming complete: load content */
             pfn_Render(g_renderer);
             if (v->pending_load_str) {
                 ULString s = pfn_CreateString(v->pending_load_str);
@@ -985,15 +985,30 @@ static void worker_do_tick(void) {
         /* Retry JS bindings if they weren't set up during fast creation */
         if (!v->js_bound && v->load_phase == 0)
             setup_js_bindings(vid);
-        for (int i = 0; i < v->mouse_count; i++) {
-            MouseQueueEntry* e = &v->mouse_queue[i];
-            int x = e->x, y = e->y;
-            if (x < 0) x = 0; if (y < 0) y = 0;
-            if (v->width > 0 && x >= v->width) x = v->width - 1;
-            if (v->height > 0 && y >= v->height) y = v->height - 1;
-            ULMouseEvent evt = pfn_CreateMouseEvent(e->type, x, y, e->button);
-            pfn_ViewFireMouseEvent(v->view, evt);
-            pfn_DestroyMouseEvent(evt);
+        /* Mouse coalescing: only send the last MOVED, but keep all DOWN/UP events.
+           When the cursor moves fast, many redundant MOVED events accumulate;
+           only the final position matters for hover/CSS. */
+        {
+            int last_moved = -1;
+            for (int i = 0; i < v->mouse_count; i++) {
+                if (v->mouse_queue[i].type == 0) /* MOVED */
+                    last_moved = i;
+            }
+            for (int i = 0; i < v->mouse_count; i++) {
+                MouseQueueEntry* e = &v->mouse_queue[i];
+                if (e->type == 0 && i != last_moved)
+                    continue; /* skip intermediate MOVED events */
+                int x = e->x, y = e->y;
+                /* Clamping: only for coords inside the viewport. Negative coordinates
+                   are sent intentionally for mouse-leave (to clear :hover). */
+                if (x >= 0 && y >= 0) {
+                    if (v->width > 0 && x >= v->width) x = v->width - 1;
+                    if (v->height > 0 && y >= v->height) y = v->height - 1;
+                }
+                ULMouseEvent evt = pfn_CreateMouseEvent(e->type, x, y, e->button);
+                pfn_ViewFireMouseEvent(v->view, evt);
+                pfn_DestroyMouseEvent(evt);
+            }
         }
         v->mouse_count = 0;
         for (int i = 0; i < v->scroll_count; i++) {
@@ -1329,7 +1344,7 @@ EXPORT void ul_view_load_url(int view_id, const char* url) {
 
 /* Async create + load URL: crea la view y programa la carga sin bloquear.
  * La carga real se procesa progresivamente en ul_tick.
- * Retorna view_id (>= 0) inmediatamente, o negativo si error.
+ * Returns view_id (>= 0) immediately, or negative on error.
  * Usar ul_view_is_ready para saber cuando esta lista. */
 EXPORT int ul_create_view_async(int width, int height, const char* url) {
 #ifdef _WIN32
@@ -1342,7 +1357,7 @@ EXPORT int ul_create_view_async(int width, int height, const char* url) {
 }
 
 /* Fast sync create + load HTML: one worker roundtrip, no sleeping.
- * Retorna view_id (>= 0) o negativo si error. */
+ * Returns view_id (>= 0) or negative on error. */
 EXPORT int ul_create_view_with_html(int width, int height, const char* html) {
 #ifdef _WIN32
     if (!g_worker_thread) return -1;
@@ -1354,7 +1369,7 @@ EXPORT int ul_create_view_with_html(int width, int height, const char* html) {
 }
 
 /* Fast sync create + load URL: one worker roundtrip, no sleeping.
- * Retorna view_id (>= 0) o negativo si error. */
+ * Returns view_id (>= 0) or negative on error. */
 EXPORT int ul_create_view_with_url(int width, int height, const char* url) {
 #ifdef _WIN32
     if (!url || !g_worker_thread) return -1;
@@ -1406,12 +1421,12 @@ EXPORT unsigned int ul_view_get_row_bytes(int view_id) {
     return pfn_SurfaceGetRowBytes(g_views[view_id].surface);
 }
 
-/* Copia pixels BGRA->RGBA al buffer destino solo si la superficie cambio.
- * Retorna 1 si se copiaron pixels (dirty), 0 si no hubo cambios. */
+/* Copies BGRA->RGBA pixels to the destination buffer only if the surface changed.
+ * Returns 1 if pixels were copied (dirty), 0 if no changes. */
 EXPORT int ul_view_copy_pixels_rgba(int view_id, unsigned char* dest, int dest_size) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !g_views[view_id].surface) return 0;
     ViewSlot* v = &g_views[view_id];
-    /* Verificar si la superficie tiene cambios */
+    /* Check if the surface has changes */
     ULIntRect dirty = pfn_SurfaceGetDirtyBounds(v->surface);
     if (dirty.left >= dirty.right || dirty.top >= dirty.bottom) return 0;
     unsigned char* src = (unsigned char*)pfn_SurfaceLockPixels(v->surface);
@@ -1424,7 +1439,7 @@ EXPORT int ul_view_copy_pixels_rgba(int view_id, unsigned char* dest, int dest_s
         pfn_SurfaceUnlockPixels(v->surface);
         return 0;
     }
-    /* Conversion BGRA -> RGBA en C (mucho mas rapido que Go) */
+    /* BGRA -> RGBA conversion in C (much faster than Go) */
     int dstIdx = 0;
     for (int y = 0; y < h; y++) {
         unsigned char* row = src + y * rowBytes;

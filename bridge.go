@@ -117,8 +117,8 @@ func unregisterView() {
 	if viewCount < 0 {
 		viewCount = 0
 	}
-	// No llamar ulDestroy() al llegar a 0 vistas: el renderer vive toda la vida
-	// de la aplicacion. ulInit usa sync.Once y no puede re-inicializarse.
+	// Don't call ulDestroy() when reaching 0 views: the renderer lives for the
+	// entire application lifetime. ulInit uses sync.Once and cannot be re-initialized.
 	viewCountMu.Unlock()
 }
 

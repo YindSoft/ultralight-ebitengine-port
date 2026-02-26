@@ -137,7 +137,7 @@ func NewFromFSAsync(width, height int, mainFile string, fsys fs.FS, opts *Option
 	norm = strings.TrimLeft(norm, "/")
 	url := "file:///" + norm
 
-	// Crear view asincronica: retorna inmediatamente, carga se procesa en ticks
+	// Create async view: returns immediately, loading is processed in ticks
 	viewID := ulCreateViewAsync(int32(width), int32(height), url)
 	if viewID < 0 {
 		return nil, fmt.Errorf("ul_create_view_async failed with code %d", viewID)

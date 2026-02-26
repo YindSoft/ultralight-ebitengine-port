@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -18,14 +18,15 @@ import (
 
 // Focus: only the focused UI receives keyboard. Mouse/scroll still require cursor in bounds.
 // Clicking inside a UI gives it focus. Call SetFocus() to assign focus without clicking.
-var (
-	focusedViewID   int32 = -1
-	focusedViewIDMu sync.Mutex
-)
+var focusedViewID atomic.Int32
 
-// GlobalCursorOffsetX/Y se restan de las coordenadas del cursor antes de verificar bounds
-// y calcular coordenadas locales. Usar cuando el área de contenido no empieza en (0,0)
-// (ej: un borde + topbar desplazan el contenido).
+func init() {
+	focusedViewID.Store(-1)
+}
+
+// GlobalCursorOffsetX/Y are subtracted from cursor coordinates before checking bounds
+// and computing local coordinates. Use when the content area doesn't start at (0,0)
+// (e.g., a border + topbar offset the content).
 var GlobalCursorOffsetX int
 var GlobalCursorOffsetY int
 
@@ -36,15 +37,11 @@ func ClearFocus() {
 }
 
 func getFocusedViewID() int32 {
-	focusedViewIDMu.Lock()
-	defer focusedViewIDMu.Unlock()
-	return focusedViewID
+	return focusedViewID.Load()
 }
 
 func setFocusedViewID(viewID int32) {
-	focusedViewIDMu.Lock()
-	defer focusedViewIDMu.Unlock()
-	focusedViewID = viewID
+	focusedViewID.Store(viewID)
 }
 
 // Options for creating the UI. All fields are optional.
@@ -68,13 +65,18 @@ type UltralightUI struct {
 	BoundsX, BoundsY, BoundsW, BoundsH int
 
 	mouseX, mouseY int
+	mouseInside    bool // true if cursor is inside bounds (to detect leave)
 	leftDown       bool
 	rightDown      bool
-	leftOutside    bool // botón izquierdo se presionó fuera de bounds (ignorar al entrar)
-	rightOutside   bool // botón derecho se presionó fuera de bounds
+	leftOutside    bool // left button was pressed outside bounds (ignore on re-enter)
+	rightOutside   bool // right button was pressed outside bounds
 	domReady       bool
 	frameCount     int
 	goHelperInjected bool
+
+	// Reusable buffers to avoid per-frame allocations in forwardKeyboard
+	keyBuf     []ebiten.Key
+	charBuf    []rune
 
 	// OnMessage is called when the page sends a message via go.send(msg).
 	// msg is a string or JSON string. Use ParseMessage to get structured data.
@@ -196,8 +198,8 @@ func (ui *UltralightUI) SetBounds(x, y, w, h int) {
 	ui.BoundsX, ui.BoundsY, ui.BoundsW, ui.BoundsH = x, y, w, h
 }
 
-// MarkDirty es un no-op mantenido por compatibilidad. Los pixels se copian
-// automaticamente cada frame cuando Ultralight tiene cambios pendientes.
+// MarkDirty is a no-op kept for compatibility. Pixels are automatically copied
+// every frame when Ultralight has pending changes.
 func (ui *UltralightUI) MarkDirty() {}
 
 // injectGoHelper ensures the window.go namespace is set up. The native __goSend
@@ -206,8 +208,9 @@ func (ui *UltralightUI) MarkDirty() {}
 // It also installs a custom undo/redo system for input/textarea elements,
 // triggered from Go via ui.Eval("__ulUndo()") / "__ulRedo()" / "__ulSelectAll()".
 func (ui *UltralightUI) injectGoHelper() {
-	ui.Eval("if(typeof window.__goSend==='function'){window.go=window.go||{};if(!window.go.send)window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};}")
-	ui.Eval(`(function(){
+	// Single combined Eval: go.send setup + undo/redo/selectAll
+	ui.Eval(`if(typeof window.__goSend==='function'){window.go=window.go||{};if(!window.go.send)window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};}
+(function(){
 if(window.__ulUndoInit)return;window.__ulUndoInit=1;
 var stacks=new WeakMap(),redos=new WeakMap(),skip=0;
 function S(e){if(!stacks.has(e))stacks.set(e,[{v:e.value,s:e.selectionStart,e:e.selectionEnd}]);return stacks.get(e)}
@@ -281,7 +284,7 @@ func (ui *UltralightUI) isHidden() bool {
 func (ui *UltralightUI) updateInternal() error {
 	ui.frameCount++
 
-	// Poll native messages (JS -> Go via go.send) — siempre, incluso oculta
+	// Poll native messages (JS -> Go via go.send) — always, even if hidden
 	for {
 		msg, ok := pollMessage(ui.viewID)
 		if !ok {
@@ -301,7 +304,7 @@ func (ui *UltralightUI) updateInternal() error {
 		ui.goHelperInjected = true
 	}
 
-	// Vista oculta: solo drenar mensajes, no procesar input ni copiar pixels
+	// Hidden view: only drain messages, skip input processing and pixel copying
 	if ui.isHidden() {
 		return nil
 	}
@@ -310,9 +313,9 @@ func (ui *UltralightUI) updateInternal() error {
 		ui.forwardInput()
 	}
 
-	// Copiar pixels solo si Ultralight tiene cambios renderizados (dirty bounds).
-	// ul_view_copy_pixels_rgba verifica internamente si la superficie cambió;
-	// si no hay cambios, retorna 0 sin copiar (muy barato: solo lee un rect).
+	// Copy pixels only if Ultralight has rendered changes (dirty bounds).
+	// ul_view_copy_pixels_rgba internally checks if the surface changed;
+	// if no changes, returns 0 without copying (very cheap: just reads a rect).
 	if ulViewCopyPixelsRGBA(ui.viewID, uintptr(unsafe.Pointer(&ui.pixels[0])), int32(len(ui.pixels))) != 0 {
 		ui.texture.WritePixels(ui.pixels)
 	}
@@ -338,6 +341,7 @@ func (ui *UltralightUI) forwardInput() {
 	}
 
 	if inBounds {
+		ui.mouseInside = true
 		lx := mx - ui.BoundsX
 		ly := my - ui.BoundsY
 		if ui.BoundsW <= 0 {
@@ -391,7 +395,14 @@ func (ui *UltralightUI) forwardInput() {
 
 		}
 	} else {
-		// Cursor fuera de bounds: si el botón se presiona afuera, marcar para ignorar al entrar
+		// Cursor left bounds: send mouse move outside the view to clear :hover
+		if ui.mouseInside {
+			ui.mouseInside = false
+			ulViewFireMouse(ui.viewID, mouseEventTypeMoved, -1, -1, mouseButtonNone)
+			ui.mouseX = -1
+			ui.mouseY = -1
+		}
+		// Cursor outside bounds: if button is pressed outside, mark to ignore on re-enter
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
 			if !ui.leftDown {
 				ui.leftOutside = true
@@ -425,7 +436,9 @@ func (ui *UltralightUI) forwardKeyboard() {
 	ctrlHeld := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
 
 	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X)
-	for _, key := range inpututil.AppendJustPressedKeys(nil) {
+	// Reuse buffer to avoid per-frame allocations
+	ui.keyBuf = inpututil.AppendJustPressedKeys(ui.keyBuf[:0])
+	for _, key := range ui.keyBuf {
 		// Intercept editing shortcuts and handle via JS (Ultralight's native
 		// key_identifier support through ulCreateKeyEvent is unreliable).
 		if ctrlHeld {
@@ -461,13 +474,15 @@ func (ui *UltralightUI) forwardKeyboard() {
 		}
 	}
 	// Character input from OS text input system (handles shift, layout, IME correctly)
-	for _, r := range ebiten.AppendInputChars(nil) {
+	ui.charBuf = ebiten.AppendInputChars(ui.charBuf[:0])
+	for _, r := range ui.charBuf {
 		if r >= 0x20 { // filter control characters (Ctrl+letter combos)
 			ulViewFireKey(ui.viewID, keyEventChar, 0, 0, string(r))
 		}
 	}
 	// Key up events
-	for _, key := range inpututil.AppendJustReleasedKeys(nil) {
+	ui.keyBuf = inpututil.AppendJustReleasedKeys(ui.keyBuf[:0])
+	for _, key := range ui.keyBuf {
 		vk, mods := keyToVK(key)
 		if vk != 0 {
 			ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, vkToChar(vk))
@@ -570,11 +585,11 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 	case ebiten.KeyArrowDown:
 		return 0x28
 
-	// Modifier keys: retornar 0 para que NO se envien a Ultralight como eventos
-	// standalone. El estado de modifiers ya se codifica en el campo 'mods' de
-	// cada evento de tecla normal. Enviarlos como RawKeyDown/KeyUp crea riesgo
-	// de desincronizacion (ej: Ctrl down sin KeyUp al cambiar foco → Ultralight
-	// cree que Ctrl sigue presionado y dispara Ctrl+A al presionar 'A').
+	// Modifier keys: return 0 so they are NOT sent to Ultralight as standalone
+	// events. Modifier state is already encoded in the 'mods' field of each
+	// regular key event. Sending them as RawKeyDown/KeyUp creates desync risk
+	// (e.g., Ctrl down without KeyUp on focus change → Ultralight thinks Ctrl
+	// is still held and fires Ctrl+A when pressing 'A').
 	case ebiten.KeyShift, ebiten.KeyShiftLeft, ebiten.KeyShiftRight:
 		return 0
 	case ebiten.KeyControl, ebiten.KeyControlLeft, ebiten.KeyControlRight:
@@ -719,10 +734,15 @@ func (ui *UltralightUI) Send(data interface{}) error {
 	if err != nil {
 		return fmt.Errorf("Send: %w", err)
 	}
+	const prefix = "if(window.go&&typeof window.go.receive==='function')window.go.receive(JSON.parse(\""
+	const suffix = "\"));"
+	// Pre-allocate builder with estimated size to avoid re-allocations
 	var sb strings.Builder
-	sb.WriteString("if(window.go&&typeof window.go.receive==='function')window.go.receive(JSON.parse(\"")
-	for _, c := range string(jsonBytes) {
-		switch c {
+	sb.Grow(len(prefix) + len(jsonBytes) + len(suffix) + 16)
+	sb.WriteString(prefix)
+	// Iterate bytes directly (avoids allocating string(jsonBytes))
+	for _, b := range jsonBytes {
+		switch b {
 		case '\\':
 			sb.WriteString(`\\`)
 		case '"':
@@ -732,10 +752,10 @@ func (ui *UltralightUI) Send(data interface{}) error {
 		case '\r':
 			sb.WriteString(`\r`)
 		default:
-			sb.WriteRune(c)
+			sb.WriteByte(b)
 		}
 	}
-	sb.WriteString("\"));")
+	sb.WriteString(suffix)
 	evalJS(ui.viewID, sb.String())
 	return nil
 }
