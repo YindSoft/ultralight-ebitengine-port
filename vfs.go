@@ -91,18 +91,12 @@ func NewFromFS(width, height int, mainFile string, fsys fs.FS, opts *Options) (*
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:         viewID,
-		texture:        ebiten.NewImage(width, height),
-		pixels:         make([]byte, width*height*4),
-		width:          width,
-		height:         height,
-		dirtyCountdown: 120,
-		rawBGRA:        make([]byte, width*height*4),
-		asyncWork:      make(chan struct{}, 1),
-		asyncDone:      make(chan struct{}, 1),
-		asyncStop:      make(chan struct{}),
+		viewID:  viewID,
+		texture: ebiten.NewImage(width, height),
+		pixels:  make([]byte, width*height*4),
+		width:   width,
+		height:  height,
 	}
-	go ui.asyncConvertLoop()
 
 	return ui, nil
 }
@@ -151,18 +145,12 @@ func NewFromFSAsync(width, height int, mainFile string, fsys fs.FS, opts *Option
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:         viewID,
-		texture:        ebiten.NewImage(width, height),
-		pixels:         make([]byte, width*height*4),
-		width:          width,
-		height:         height,
-		dirtyCountdown: 120,
-		rawBGRA:        make([]byte, width*height*4),
-		asyncWork:      make(chan struct{}, 1),
-		asyncDone:      make(chan struct{}, 1),
-		asyncStop:      make(chan struct{}),
+		viewID:  viewID,
+		texture: ebiten.NewImage(width, height),
+		pixels:  make([]byte, width*height*4),
+		width:   width,
+		height:  height,
 	}
-	go ui.asyncConvertLoop()
 
 	return ui, nil
 }

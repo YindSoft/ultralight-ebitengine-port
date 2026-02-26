@@ -23,6 +23,12 @@ var (
 	focusedViewIDMu sync.Mutex
 )
 
+// GlobalCursorOffsetX/Y se restan de las coordenadas del cursor antes de verificar bounds
+// y calcular coordenadas locales. Usar cuando el área de contenido no empieza en (0,0)
+// (ej: un borde + topbar desplazan el contenido).
+var GlobalCursorOffsetX int
+var GlobalCursorOffsetY int
+
 // ClearFocus removes keyboard focus from all views. After this call,
 // no UI receives key events (keys go back to the game).
 func ClearFocus() {
@@ -64,26 +70,11 @@ type UltralightUI struct {
 	mouseX, mouseY int
 	leftDown       bool
 	rightDown      bool
+	leftOutside    bool // botón izquierdo se presionó fuera de bounds (ignorar al entrar)
+	rightOutside   bool // botón derecho se presionó fuera de bounds
 	domReady       bool
 	frameCount     int
 	goHelperInjected bool
-
-	// dirtyCountdown: frames restantes para copiar pixels. Se decrementa cada frame.
-	// Cuando llega a 0, se deja de copiar (la textura queda congelada hasta el proximo markDirty).
-	dirtyCountdown int
-
-	// Pipeline async de pixels: la conversion BGRA→RGBA corre en un goroutine separado.
-	// Main thread hace memcpy rapido a rawBGRA y señala asyncWork.
-	// El goroutine convierte a pixels y señala asyncDone.
-	// Main thread hace WritePixels (upload GPU rapido).
-	rawBGRA   []byte         // buffer para copia rapida de BGRA crudo
-	convW     int            // ancho de la conversion en curso
-	convH     int            // alto de la conversion en curso
-	convRow   int            // rowBytes de la conversion en curso
-	asyncWork chan struct{}  // señal: rawBGRA tiene datos nuevos
-	asyncDone chan struct{}  // señal: pixels tiene resultado listo
-	asyncStop chan struct{}  // cerrar goroutine al destruir la vista
-	asyncBusy bool           // true: goroutine procesando, no tocar rawBGRA
 
 	// OnMessage is called when the page sends a message via go.send(msg).
 	// msg is a string or JSON string. Use ParseMessage to get structured data.
@@ -146,18 +137,12 @@ func newUI(width, height int, html []byte) (*UltralightUI, error) {
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:         viewID,
-		texture:        ebiten.NewImage(width, height),
-		pixels:         make([]byte, width*height*4),
-		width:          width,
-		height:         height,
-		dirtyCountdown: 120, // ~2s a 60fps para carga inicial
-		rawBGRA:        make([]byte, width*height*4),
-		asyncWork:      make(chan struct{}, 1),
-		asyncDone:      make(chan struct{}, 1),
-		asyncStop:      make(chan struct{}),
+		viewID:  viewID,
+		texture: ebiten.NewImage(width, height),
+		pixels:  make([]byte, width*height*4),
+		width:   width,
+		height:  height,
 	}
-	go ui.asyncConvertLoop()
 	return ui, nil
 }
 
@@ -170,18 +155,12 @@ func newUIWithURL(width, height int, url string) (*UltralightUI, error) {
 	registerView()
 
 	ui := &UltralightUI{
-		viewID:         viewID,
-		texture:        ebiten.NewImage(width, height),
-		pixels:         make([]byte, width*height*4),
-		width:          width,
-		height:         height,
-		dirtyCountdown: 120, // ~2s a 60fps para carga inicial
-		rawBGRA:        make([]byte, width*height*4),
-		asyncWork:      make(chan struct{}, 1),
-		asyncDone:      make(chan struct{}, 1),
-		asyncStop:      make(chan struct{}),
+		viewID:  viewID,
+		texture: ebiten.NewImage(width, height),
+		pixels:  make([]byte, width*height*4),
+		width:   width,
+		height:  height,
 	}
-	go ui.asyncConvertLoop()
 	return ui, nil
 }
 
@@ -217,22 +196,53 @@ func (ui *UltralightUI) SetBounds(x, y, w, h int) {
 	ui.BoundsX, ui.BoundsY, ui.BoundsW, ui.BoundsH = x, y, w, h
 }
 
-// markDirty señala que el contenido visual cambió. Activa la copia de pixels
-// durante los proximos frames para capturar la actualizacion y transiciones CSS.
-func (ui *UltralightUI) markDirty() {
-	ui.dirtyCountdown = 30 // ~500ms a 60fps, cubre transiciones CSS tipicas
-}
-
-// MarkDirty señala externamente que el contenido visual cambió.
-func (ui *UltralightUI) MarkDirty() {
-	ui.markDirty()
-}
+// MarkDirty es un no-op mantenido por compatibilidad. Los pixels se copian
+// automaticamente cada frame cuando Ultralight tiene cambios pendientes.
+func (ui *UltralightUI) MarkDirty() {}
 
 // injectGoHelper ensures the window.go namespace is set up. The native __goSend
 // function is registered by the C bridge via JavaScriptCore. This ensures
 // go.send wraps it with JSON serialization for non-string values.
+// It also installs a custom undo/redo system for input/textarea elements,
+// triggered from Go via ui.Eval("__ulUndo()") / "__ulRedo()" / "__ulSelectAll()".
 func (ui *UltralightUI) injectGoHelper() {
 	ui.Eval("if(typeof window.__goSend==='function'){window.go=window.go||{};if(!window.go.send)window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};}")
+	ui.Eval(`(function(){
+if(window.__ulUndoInit)return;window.__ulUndoInit=1;
+var stacks=new WeakMap(),redos=new WeakMap(),skip=0;
+function S(e){if(!stacks.has(e))stacks.set(e,[{v:e.value,s:e.selectionStart,e:e.selectionEnd}]);return stacks.get(e)}
+function R(e){if(!redos.has(e))redos.set(e,[]);return redos.get(e)}
+document.addEventListener('input',function(ev){
+if(skip)return;var e=ev.target;if(!e)return;var t=e.tagName;
+if(t!=='INPUT'&&t!=='TEXTAREA'&&!e.isContentEditable)return;
+if(e.isContentEditable){S(e).push({v:e.innerHTML,s:0,e:0})}
+else{S(e).push({v:e.value,s:e.selectionStart,e:e.selectionEnd})}
+R(e).length=0;
+},true);
+window.__ulUndo=function(){
+var e=document.activeElement;if(!e)return;
+var s=S(e);if(s.length<=1)return;
+R(e).push(s.pop());var p=s[s.length-1];
+skip=1;
+if(e.isContentEditable){e.innerHTML=p.v}
+else{e.value=p.v;e.setSelectionRange(p.s,p.e)}
+skip=0;
+};
+window.__ulRedo=function(){
+var e=document.activeElement;if(!e)return;
+var r=R(e);if(!r.length)return;var p=r.pop();
+S(e).push(p);
+skip=1;
+if(e.isContentEditable){e.innerHTML=p.v}
+else{e.value=p.v;e.setSelectionRange(p.s,p.e)}
+skip=0;
+};
+window.__ulSelectAll=function(){
+var e=document.activeElement;if(!e)return;
+if(e.select){e.select()}
+else if(e.isContentEditable){var r=document.createRange();r.selectNodeContents(e);var s=window.getSelection();s.removeAllRanges();s.addRange(r)}
+};
+})();`)
 }
 
 // Tick calls the Ultralight renderer once (Update + RefreshDisplay + Render for all views).
@@ -300,26 +310,11 @@ func (ui *UltralightUI) updateInternal() error {
 		ui.forwardInput()
 	}
 
-	// Pipeline async de pixels: solo cuando hay cambios visuales pendientes
-	if ui.dirtyCountdown > 0 {
-		// Recoger resultado del goroutine background si hay
-		select {
-		case <-ui.asyncDone:
-			ui.texture.WritePixels(ui.pixels)
-			ui.dirtyCountdown--
-			ui.asyncBusy = false
-		default:
-		}
-		// Iniciar nueva copia si el goroutine no esta ocupado
-		if !ui.asyncBusy {
-			if ui.grabRawPixels() {
-				select {
-				case ui.asyncWork <- struct{}{}:
-					ui.asyncBusy = true
-				default:
-				}
-			}
-		}
+	// Copiar pixels solo si Ultralight tiene cambios renderizados (dirty bounds).
+	// ul_view_copy_pixels_rgba verifica internamente si la superficie cambió;
+	// si no hay cambios, retorna 0 sin copiar (muy barato: solo lee un rect).
+	if ulViewCopyPixelsRGBA(ui.viewID, uintptr(unsafe.Pointer(&ui.pixels[0])), int32(len(ui.pixels))) != 0 {
+		ui.texture.WritePixels(ui.pixels)
 	}
 	return nil
 }
@@ -334,6 +329,8 @@ func (ui *UltralightUI) inBounds(mx, my int) bool {
 
 func (ui *UltralightUI) forwardInput() {
 	mx, my := ebiten.CursorPosition()
+	mx -= GlobalCursorOffsetX
+	my -= GlobalCursorOffsetY
 	inBounds := ui.inBounds(mx, my)
 
 	if inBounds && inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
@@ -356,40 +353,60 @@ func (ui *UltralightUI) forwardInput() {
 			ulViewFireMouse(ui.viewID, mouseEventTypeMoved, int32(lx), int32(ly), moveBtn)
 			ui.mouseX = lx
 			ui.mouseY = ly
-			// Refrescar textura brevemente para capturar hover CSS (~167ms cubre transiciones de 150ms)
-			if ui.dirtyCountdown < 10 {
-				ui.dirtyCountdown = 10
-			}
 		}
 
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
-			if !ui.leftDown {
+			if !ui.leftDown && !ui.leftOutside {
 				ui.leftDown = true
 				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonLeft)
-				ui.markDirty()
+	
 			}
-		} else if ui.leftDown {
-			ui.leftDown = false
-			ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonLeft)
-			ui.markDirty()
+		} else {
+			if ui.leftDown {
+				ui.leftDown = false
+				ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonLeft)
+	
+			}
+			ui.leftOutside = false
 		}
 
 		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonRight) {
-			if !ui.rightDown {
+			if !ui.rightDown && !ui.rightOutside {
 				ui.rightDown = true
 				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonRight)
-				ui.markDirty()
+	
 			}
-		} else if ui.rightDown {
-			ui.rightDown = false
-			ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonRight)
-			ui.markDirty()
+		} else {
+			if ui.rightDown {
+				ui.rightDown = false
+				ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonRight)
+	
+			}
+			ui.rightOutside = false
 		}
 
 		_, scrollY := ebiten.Wheel()
 		if scrollY != 0 {
 			ulViewFireScroll(ui.viewID, scrollEventTypeByPixel, 0, int32(scrollY*100))
-			ui.markDirty()
+
+		}
+	} else {
+		// Cursor fuera de bounds: si el botón se presiona afuera, marcar para ignorar al entrar
+		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+			if !ui.leftDown {
+				ui.leftOutside = true
+			}
+		} else {
+			ui.leftOutside = false
+			ui.leftDown = false
+		}
+		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonRight) {
+			if !ui.rightDown {
+				ui.rightOutside = true
+			}
+		} else {
+			ui.rightOutside = false
+			ui.rightDown = false
 		}
 	}
 
@@ -405,13 +422,32 @@ const (
 )
 
 func (ui *UltralightUI) forwardKeyboard() {
-	dirty := false
-	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X/A/Z)
+	ctrlHeld := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
+
+	// Key down events (RawKeyDown triggers accelerators like Ctrl+C/V/X)
 	for _, key := range inpututil.AppendJustPressedKeys(nil) {
+		// Intercept editing shortcuts and handle via JS (Ultralight's native
+		// key_identifier support through ulCreateKeyEvent is unreliable).
+		if ctrlHeld {
+			switch key {
+			case ebiten.KeyZ:
+				if ebiten.IsKeyPressed(ebiten.KeyShift) {
+					ui.Eval("if(window.__ulRedo)__ulRedo()")
+				} else {
+					ui.Eval("if(window.__ulUndo)__ulUndo()")
+				}
+				continue
+			case ebiten.KeyY:
+				ui.Eval("if(window.__ulRedo)__ulRedo()")
+				continue
+			case ebiten.KeyA:
+				ui.Eval("if(window.__ulSelectAll)__ulSelectAll()")
+				continue
+			}
+		}
 		vk, mods := keyToVK(key)
 		if vk != 0 {
 			ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, vkToChar(vk))
-			dirty = true
 		}
 	}
 	// Key repeat: re-fire RawKeyDown for held non-character keys (Backspace, Delete, arrows, etc.)
@@ -421,7 +457,6 @@ func (ui *UltralightUI) forwardKeyboard() {
 			vk, mods := keyToVK(key)
 			if vk != 0 {
 				ulViewFireKey(ui.viewID, keyEventRawKeyDown, vk, mods, vkToChar(vk))
-				dirty = true
 			}
 		}
 	}
@@ -429,7 +464,6 @@ func (ui *UltralightUI) forwardKeyboard() {
 	for _, r := range ebiten.AppendInputChars(nil) {
 		if r >= 0x20 { // filter control characters (Ctrl+letter combos)
 			ulViewFireKey(ui.viewID, keyEventChar, 0, 0, string(r))
-			dirty = true
 		}
 	}
 	// Key up events
@@ -437,11 +471,7 @@ func (ui *UltralightUI) forwardKeyboard() {
 		vk, mods := keyToVK(key)
 		if vk != 0 {
 			ulViewFireKey(ui.viewID, keyEventKeyUp, vk, mods, vkToChar(vk))
-			dirty = true
 		}
-	}
-	if dirty {
-		ui.markDirty()
 	}
 }
 
@@ -540,15 +570,19 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 	case ebiten.KeyArrowDown:
 		return 0x28
 
-	// Modifier keys
+	// Modifier keys: retornar 0 para que NO se envien a Ultralight como eventos
+	// standalone. El estado de modifiers ya se codifica en el campo 'mods' de
+	// cada evento de tecla normal. Enviarlos como RawKeyDown/KeyUp crea riesgo
+	// de desincronizacion (ej: Ctrl down sin KeyUp al cambiar foco → Ultralight
+	// cree que Ctrl sigue presionado y dispara Ctrl+A al presionar 'A').
 	case ebiten.KeyShift, ebiten.KeyShiftLeft, ebiten.KeyShiftRight:
-		return 0x10
+		return 0
 	case ebiten.KeyControl, ebiten.KeyControlLeft, ebiten.KeyControlRight:
-		return 0x11
+		return 0
 	case ebiten.KeyAlt, ebiten.KeyAltLeft, ebiten.KeyAltRight:
-		return 0x12
+		return 0
 	case ebiten.KeyMeta, ebiten.KeyMetaLeft, ebiten.KeyMetaRight:
-		return 0x5B
+		return 0
 
 	// Lock keys
 	case ebiten.KeyCapsLock:
@@ -644,66 +678,6 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 	}
 }
 
-// grabRawPixels copia los bytes BGRA crudos de Ultralight a rawBGRA (main thread).
-// Usa copy() (memcpy nativo) para minimizar el tiempo con el pixel lock retenido.
-func (ui *UltralightUI) grabRawPixels() bool {
-	ptr := ulViewGetPixels(ui.viewID)
-	if ptr == 0 {
-		return false
-	}
-
-	w := ulViewGetWidth(ui.viewID)
-	h := ulViewGetHeight(ui.viewID)
-	rowBytes := ulViewGetRowBytes(ui.viewID)
-
-	if w == 0 || h == 0 {
-		ulViewUnlockPixels(ui.viewID)
-		return false
-	}
-
-	totalBytes := int(rowBytes) * int(h)
-	src := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), totalBytes)
-
-	// Asegurar que rawBGRA tiene capacidad suficiente (rowBytes puede tener padding)
-	if totalBytes > len(ui.rawBGRA) {
-		ui.rawBGRA = make([]byte, totalBytes)
-	}
-	copy(ui.rawBGRA[:totalBytes], src)
-	ulViewUnlockPixels(ui.viewID)
-
-	ui.convW = int(w)
-	ui.convH = int(h)
-	ui.convRow = int(rowBytes)
-	return true
-}
-
-// asyncConvertLoop corre en un goroutine separado. Convierte BGRA→RGBA sin bloquear el game loop.
-func (ui *UltralightUI) asyncConvertLoop() {
-	for {
-		select {
-		case <-ui.asyncStop:
-			return
-		case <-ui.asyncWork:
-			w, h, rowBytes := ui.convW, ui.convH, ui.convRow
-			dstIdx := 0
-			for y := 0; y < h; y++ {
-				srcRow := ui.rawBGRA[y*rowBytes : y*rowBytes+w*4]
-				for x := 0; x < w*4; x += 4 {
-					ui.pixels[dstIdx+0] = srcRow[x+2] // BGRA -> RGBA
-					ui.pixels[dstIdx+1] = srcRow[x+1]
-					ui.pixels[dstIdx+2] = srcRow[x+0]
-					ui.pixels[dstIdx+3] = srcRow[x+3]
-					dstIdx += 4
-				}
-			}
-			select {
-			case ui.asyncDone <- struct{}{}:
-			default:
-			}
-		}
-	}
-}
-
 // GetTexture returns the Ebiten image with the current HTML content rendered.
 func (ui *UltralightUI) GetTexture() *ebiten.Image {
 	return ui.texture
@@ -715,7 +689,6 @@ func (ui *UltralightUI) Eval(script string) {
 		return
 	}
 	evalJS(ui.viewID, script)
-	ui.markDirty()
 }
 
 // ParseMessage parses msg as JSON if it looks like JSON (starts with '{' or '[').
@@ -764,7 +737,6 @@ func (ui *UltralightUI) Send(data interface{}) error {
 	}
 	sb.WriteString("\"));")
 	evalJS(ui.viewID, sb.String())
-	ui.markDirty()
 	return nil
 }
 
@@ -785,8 +757,6 @@ func (ui *UltralightUI) Close() {
 		return
 	}
 	ui.closed = true
-	// Detener goroutine de conversion async
-	close(ui.asyncStop)
 	if getFocusedViewID() == ui.viewID {
 		setFocusedViewID(-1)
 	}

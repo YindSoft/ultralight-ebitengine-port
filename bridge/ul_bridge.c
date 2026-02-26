@@ -108,6 +108,9 @@ typedef void          (*PFN_ulViewFireScrollEvent)(ULView, ULScrollEvent);
 typedef void          (*PFN_ulViewFireKeyEvent)(ULView, ULKeyEvent);
 typedef ULKeyEvent    (*PFN_ulCreateKeyEvent)(ULKeyEventType, unsigned int, int, int, ULString, ULString, bool, bool, bool);
 typedef void          (*PFN_ulDestroyKeyEvent)(ULKeyEvent);
+#ifdef _WIN32
+typedef ULKeyEvent    (*PFN_ulCreateKeyEventWindows)(ULKeyEventType, uintptr_t, intptr_t, bool);
+#endif
 typedef void*         (*PFN_ulSurfaceLockPixels)(ULSurface);
 typedef void          (*PFN_ulSurfaceUnlockPixels)(ULSurface);
 typedef unsigned int  (*PFN_ulSurfaceGetWidth)(ULSurface);
@@ -206,6 +209,9 @@ static PFN_ulViewFireScrollEvent       pfn_ViewFireScrollEvent;
 static PFN_ulViewFireKeyEvent          pfn_ViewFireKeyEvent;
 static PFN_ulCreateKeyEvent            pfn_CreateKeyEvent;
 static PFN_ulDestroyKeyEvent           pfn_DestroyKeyEvent;
+#ifdef _WIN32
+static PFN_ulCreateKeyEventWindows     pfn_CreateKeyEventWin;
+#endif
 static PFN_ulCreateMouseEvent          pfn_CreateMouseEvent;
 static PFN_ulDestroyMouseEvent         pfn_DestroyMouseEvent;
 static PFN_ulCreateScrollEvent         pfn_CreateScrollEvent;
@@ -641,6 +647,10 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_ViewFireKeyEvent, "ulViewFireKeyEvent");
     RESOLVE(g_hUltralight, pfn_CreateKeyEvent, "ulCreateKeyEvent");
     RESOLVE(g_hUltralight, pfn_DestroyKeyEvent, "ulDestroyKeyEvent");
+#ifdef _WIN32
+    /* Optional: ulCreateKeyEventWindows properly fills key_identifier, text, etc. */
+    pfn_CreateKeyEventWin = (PFN_ulCreateKeyEventWindows)GetProcAddress((HMODULE)g_hUltralight, "ulCreateKeyEventWindows");
+#endif
     RESOLVE(g_hUltralight, pfn_CreateMouseEvent, "ulCreateMouseEvent");
     RESOLVE(g_hUltralight, pfn_DestroyMouseEvent, "ulDestroyMouseEvent");
     RESOLVE(g_hUltralight, pfn_CreateScrollEvent, "ulCreateScrollEvent");
@@ -997,13 +1007,42 @@ static void worker_do_tick(void) {
             KeyQueueEntry* e = &v->key_queue[i];
             /* Map type (0=RawKeyDown,1=KeyDown,2=KeyUp,3=Char) to SDK enum (0=KeyDown,1=KeyUp,2=RawKeyDown,3=Char) */
             unsigned int ul_type = (unsigned int)(e->type == 0 ? 2 : e->type == 1 ? 0 : e->type == 2 ? 1 : 3);
-            ULString s_text = pfn_CreateString(e->text[0] ? e->text : "");
-            ULString s_umod = pfn_CreateString(e->text[0] ? e->text : "");
-            ULKeyEvent evt = pfn_CreateKeyEvent((ULKeyEventType)ul_type, e->mods, e->vk, e->vk, s_text, s_umod, false, false, false);
-            pfn_ViewFireKeyEvent(v->view, evt);
-            pfn_DestroyKeyEvent(evt);
-            pfn_DestroyString(s_text);
-            pfn_DestroyString(s_umod);
+#ifdef _WIN32
+            if (pfn_CreateKeyEventWin && e->type != 3) {
+                /* Use Windows API: properly sets key_identifier, text, unmodified_text.
+                   ulCreateKeyEventWindows reads modifier state via GetKeyState() which
+                   uses the calling thread's key state table. We sync it from our queued
+                   modifier flags so the worker thread produces correct results. */
+                BYTE ks[256];
+                GetKeyboardState(ks);
+                BYTE saved[256];
+                memcpy(saved, ks, 256);
+                memset(ks, 0, 256);
+                if (e->mods & 2)  { ks[VK_CONTROL] = 0x80; ks[VK_LCONTROL] = 0x80; }
+                if (e->mods & 8)  { ks[VK_SHIFT]   = 0x80; ks[VK_LSHIFT]   = 0x80; }
+                if (e->mods & 1)  { ks[VK_MENU]    = 0x80; ks[VK_LMENU]    = 0x80; }
+                if (e->mods & 4)  { ks[VK_LWIN]    = 0x80; }
+                SetKeyboardState(ks);
+
+                UINT scan = MapVirtualKey((UINT)e->vk, 0/*MAPVK_VK_TO_VSC*/);
+                LPARAM lp = (LPARAM)(1 | (scan << 16));
+                if (ul_type == 1) lp |= (LPARAM)((1u << 30) | (1u << 31)); /* KeyUp flags */
+                ULKeyEvent evt = pfn_CreateKeyEventWin((ULKeyEventType)ul_type, (uintptr_t)e->vk, lp, false);
+                pfn_ViewFireKeyEvent(v->view, evt);
+                pfn_DestroyKeyEvent(evt);
+
+                SetKeyboardState(saved);
+            } else
+#endif
+            {
+                ULString s_text = pfn_CreateString(e->text[0] ? e->text : "");
+                ULString s_umod = pfn_CreateString(e->text[0] ? e->text : "");
+                ULKeyEvent evt = pfn_CreateKeyEvent((ULKeyEventType)ul_type, e->mods, e->vk, e->vk, s_text, s_umod, false, false, false);
+                pfn_ViewFireKeyEvent(v->view, evt);
+                pfn_DestroyKeyEvent(evt);
+                pfn_DestroyString(s_text);
+                pfn_DestroyString(s_umod);
+            }
         }
         v->key_count = 0;
         for (int i = 0; i < v->js_count; i++) {
