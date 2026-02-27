@@ -20,8 +20,13 @@ import (
 // Clicking inside a UI gives it focus. Call SetFocus() to assign focus without clicking.
 var focusedViewID atomic.Int32
 
+// inputFocusViewID tracks which view has a text input element focused in the DOM.
+// Used by HasInputFocus() to let the host skip game keybindings while the user types.
+var inputFocusViewID atomic.Int32
+
 func init() {
 	focusedViewID.Store(-1)
+	inputFocusViewID.Store(-1)
 }
 
 // GlobalCursorOffsetX/Y are subtracted from cursor coordinates before checking bounds
@@ -34,6 +39,14 @@ var GlobalCursorOffsetY int
 // no UI receives key events (keys go back to the game).
 func ClearFocus() {
 	setFocusedViewID(-1)
+}
+
+// HasInputFocus returns true if the currently focused view has a text input
+// element (input, textarea, contenteditable) focused in the DOM.
+// Use this to skip game keybindings while the user is typing in an HTML view.
+func HasInputFocus() bool {
+	ifvid := inputFocusViewID.Load()
+	return ifvid >= 0 && getFocusedViewID() == ifvid
 }
 
 func getFocusedViewID() int32 {
@@ -289,6 +302,10 @@ func (ui *UltralightUI) updateInternal() error {
 		msg, ok := pollMessage(ui.viewID)
 		if !ok {
 			break
+		}
+		// Interceptar mensajes de focus de input (no reenviar a OnMessage)
+		if ui.handleInputFocusMsg(msg) {
+			continue
 		}
 		if ui.OnMessage != nil {
 			ui.OnMessage(msg)
@@ -770,6 +787,28 @@ func (ui *UltralightUI) IsReady() bool {
 	return ulViewIsReady(ui.viewID) != 0
 }
 
+// handleInputFocusMsg intercepts __inputFocus messages sent by common.js
+// when a text input gains or loses DOM focus. Returns true if the message
+// was consumed (caller should skip OnMessage).
+func (ui *UltralightUI) handleInputFocusMsg(msg string) bool {
+	if !strings.Contains(msg, "__inputFocus") {
+		return false
+	}
+	var data struct {
+		Action  string `json:"action"`
+		Focused bool   `json:"focused"`
+	}
+	if json.Unmarshal([]byte(msg), &data) != nil || data.Action != "__inputFocus" {
+		return false
+	}
+	if data.Focused {
+		inputFocusViewID.Store(ui.viewID)
+	} else {
+		inputFocusViewID.CompareAndSwap(ui.viewID, -1)
+	}
+	return true
+}
+
 // Close releases resources. Call when done (e.g. defer ui.Close()).
 // After Close, the UI must not be used.
 func (ui *UltralightUI) Close() {
@@ -777,6 +816,7 @@ func (ui *UltralightUI) Close() {
 		return
 	}
 	ui.closed = true
+	inputFocusViewID.CompareAndSwap(ui.viewID, -1)
 	if getFocusedViewID() == ui.viewID {
 		setFocusedViewID(-1)
 	}
