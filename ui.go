@@ -778,7 +778,7 @@ func (ui *UltralightUI) IsReady() bool {
 // when a text input gains or loses DOM focus. Returns true if the message
 // was consumed (caller should skip OnMessage).
 func (ui *UltralightUI) handleInputFocusMsg(msg string) bool {
-	if !strings.Contains(msg, "__inputFocus") {
+	if !strings.HasPrefix(msg, "{\"action\":\"__inputFocus\"") {
 		return false
 	}
 	var data struct {

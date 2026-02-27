@@ -247,10 +247,7 @@ static PFN_JSValueToStringCopy                 pfn_JSValueToStringCopy;
 
 /* ── Queue and view constants ────────────────────────────────────── */
 #define MAX_VIEWS 16
-#define CONSOLE_MSG_MAX    64
-#define CONSOLE_MSG_BUFLEN 2048
-#define MSG_QUEUE_MAX      64
-#define MSG_QUEUE_BUFLEN   8192
+#define CIRC_QUEUE_INITIAL 16
 #define MOUSE_QUEUE_MAX    64
 #define SCROLL_QUEUE_MAX   16
 #define KEY_QUEUE_MAX      32
@@ -267,8 +264,9 @@ typedef struct {
     int       width;
     int       height;
     bool      used;
-    char      console_msgs[CONSOLE_MSG_MAX][CONSOLE_MSG_BUFLEN];
-    int       console_lens[CONSOLE_MSG_MAX];
+    char**    console_msgs;
+    int*      console_lens;
+    int       console_capacity;
     int       console_head;
     int       console_tail;
     int       console_count;
@@ -282,8 +280,9 @@ typedef struct {
     int       js_count;
     int       js_capacity;
     /* Native message queue (JS -> Go via __goSend, not console) */
-    char      msg_queue[MSG_QUEUE_MAX][MSG_QUEUE_BUFLEN];
-    int       msg_lens[MSG_QUEUE_MAX];
+    char**    msg_queue;
+    int*      msg_lens;
+    int       msg_capacity;
     int       msg_head;
     int       msg_tail;
     int       msg_count;
@@ -295,6 +294,44 @@ typedef struct {
     bool      js_bound;           /* true if setup_js_bindings completed successfully */
     JSContextRef cached_ctx;    /* cached JSC context for callback matching */
 } ViewSlot;
+
+/* ── Circular queue helpers (dynamic) ────────────────────────────────── */
+/* Inicializa una cola circular dinamica. Retorna false si falla malloc. */
+static bool circ_queue_init(char*** q, int** lens, int* cap) {
+    *q = (char**)calloc(CIRC_QUEUE_INITIAL, sizeof(char*));
+    *lens = (int*)calloc(CIRC_QUEUE_INITIAL, sizeof(int));
+    if (!*q || !*lens) { free(*q); free(*lens); *q = NULL; *lens = NULL; *cap = 0; return false; }
+    *cap = CIRC_QUEUE_INITIAL;
+    return true;
+}
+/* Duplica la capacidad de una cola circular, linealizando los elementos. */
+static bool circ_queue_grow(char*** q, int** lens, int* cap, int count, int* tail, int* head) {
+    int old_cap = *cap;
+    int new_cap = old_cap * 2;
+    char** nq = (char**)malloc(sizeof(char*) * new_cap);
+    int* nl = (int*)malloc(sizeof(int) * new_cap);
+    if (!nq || !nl) { free(nq); free(nl); return false; }
+    memset(nq, 0, sizeof(char*) * new_cap);
+    memset(nl, 0, sizeof(int) * new_cap);
+    for (int i = 0; i < count; i++) {
+        int src = (*tail + i) % old_cap;
+        nq[i] = (*q)[src];
+        nl[i] = (*lens)[src];
+    }
+    free(*q); free(*lens);
+    *q = nq; *lens = nl; *cap = new_cap;
+    *tail = 0; *head = count;
+    return true;
+}
+/* Libera todos los elementos y arrays de una cola circular. */
+static void circ_queue_free(char*** q, int** lens, int* cap, int* head, int* tail, int* count) {
+    if (*q) {
+        for (int i = 0; i < *count; i++) free((*q)[(*tail + i) % *cap]);
+        free(*q); *q = NULL;
+    }
+    if (*lens) { free(*lens); *lens = NULL; }
+    *cap = *head = *tail = *count = 0;
+}
 
 static ULRenderer g_renderer = NULL;
 static ViewSlot   g_views[MAX_VIEWS];
@@ -591,15 +628,20 @@ static void console_message_cb(void* user_data, ULView caller, ULMessageSource s
     char* data = pfn_StringGetData(message);
     size_t len = pfn_StringGetLength(message);
     if (!data || len == 0) return;
-    if (v->console_count >= CONSOLE_MSG_MAX) {
-        v->console_tail = (v->console_tail + 1) % CONSOLE_MSG_MAX;
-        v->console_count--;
+    /* Lazy init */
+    if (!v->console_msgs && !circ_queue_init(&v->console_msgs, &v->console_lens, &v->console_capacity)) return;
+    /* Grow if full */
+    if (v->console_count >= v->console_capacity) {
+        if (!circ_queue_grow(&v->console_msgs, &v->console_lens, &v->console_capacity,
+                             v->console_count, &v->console_tail, &v->console_head)) return;
     }
-    size_t copy_len = len < (CONSOLE_MSG_BUFLEN - 1) ? len : (CONSOLE_MSG_BUFLEN - 1);
-    memcpy(v->console_msgs[v->console_head], data, copy_len);
-    v->console_msgs[v->console_head][copy_len] = '\0';
-    v->console_lens[v->console_head] = (int)copy_len;
-    v->console_head = (v->console_head + 1) % CONSOLE_MSG_MAX;
+    char* entry = (char*)malloc(len + 1);
+    if (!entry) return;
+    memcpy(entry, data, len);
+    entry[len] = '\0';
+    v->console_msgs[v->console_head] = entry;
+    v->console_lens[v->console_head] = (int)len;
+    v->console_head = (v->console_head + 1) % v->console_capacity;
     v->console_count++;
 }
 
@@ -714,16 +756,29 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     size_t maxLen = pfn_JSStringGetMaximumUTF8CStringSize(jsStr);
     ViewSlot* v = &g_views[vid];
 
-    if (v->msg_count < MSG_QUEUE_MAX && maxLen < MSG_QUEUE_BUFLEN) {
-        size_t written = pfn_JSStringGetUTF8CString(jsStr, v->msg_queue[v->msg_head], MSG_QUEUE_BUFLEN);
-        if (written > 0) written--; /* JSStringGetUTF8CString includes null in the count */
-        v->msg_lens[v->msg_head] = (int)written;
-        v->msg_head = (v->msg_head + 1) % MSG_QUEUE_MAX;
-        v->msg_count++;
-        blog("jsc_goSend_callback: vid=%d msg='%s' len=%d", vid, v->msg_queue[(v->msg_head - 1 + MSG_QUEUE_MAX) % MSG_QUEUE_MAX], (int)written);
-    } else {
-        blog("jsc_goSend_callback: queue full or msg too large (count=%d maxLen=%zu)", v->msg_count, maxLen);
+    /* Lazy init */
+    if (!v->msg_queue && !circ_queue_init(&v->msg_queue, &v->msg_lens, &v->msg_capacity)) {
+        pfn_JSStringRelease(jsStr);
+        return NULL;
     }
+    /* Grow if full */
+    if (v->msg_count >= v->msg_capacity) {
+        if (!circ_queue_grow(&v->msg_queue, &v->msg_lens, &v->msg_capacity,
+                             v->msg_count, &v->msg_tail, &v->msg_head)) {
+            blog("jsc_goSend_callback: grow failed");
+            pfn_JSStringRelease(jsStr);
+            return NULL;
+        }
+    }
+    char* entry = (char*)malloc(maxLen);
+    if (!entry) { pfn_JSStringRelease(jsStr); return NULL; }
+    size_t written = pfn_JSStringGetUTF8CString(jsStr, entry, maxLen);
+    if (written > 0) written--; /* JSStringGetUTF8CString includes null in the count */
+    v->msg_queue[v->msg_head] = entry;
+    v->msg_lens[v->msg_head] = (int)written;
+    v->msg_head = (v->msg_head + 1) % v->msg_capacity;
+    v->msg_count++;
+    blog("jsc_goSend_callback: vid=%d len=%d", vid, (int)written);
     pfn_JSStringRelease(jsStr);
     return NULL;
 }
@@ -851,16 +906,16 @@ static void worker_do_destroy_view(int vid) {
     v->js_bound = false;
     v->load_phase = 0;
     if (v->pending_load_str) { free(v->pending_load_str); v->pending_load_str = NULL; }
-    /* Liberar cola JS dinamica */
+    /* Liberar colas dinamicas */
     if (v->js_queue) {
-        for (int i = 0; i < v->js_count; i++) {
-            free(v->js_queue[i]);
-        }
-        free(v->js_queue);
-        v->js_queue = NULL;
+        for (int i = 0; i < v->js_count; i++) free(v->js_queue[i]);
+        free(v->js_queue); v->js_queue = NULL;
     }
-    v->js_count = 0;
-    v->js_capacity = 0;
+    v->js_count = 0; v->js_capacity = 0;
+    circ_queue_free(&v->msg_queue, &v->msg_lens, &v->msg_capacity,
+                    &v->msg_head, &v->msg_tail, &v->msg_count);
+    circ_queue_free(&v->console_msgs, &v->console_lens, &v->console_capacity,
+                    &v->console_head, &v->console_tail, &v->console_count);
     g_view_count--;
 }
 
@@ -1028,20 +1083,24 @@ static void worker_do_tick(void) {
             pfn_DestroyScrollEvent(evt);
         }
         v->scroll_count = 0;
+#ifdef _WIN32
+        /* Guardar keyboard state una sola vez antes del loop para evitar
+           Get/SetKeyboardState + memcpy por cada tecla (~8KB de copias eliminadas) */
+        BYTE saved_ks[256];
+        bool ks_saved = false;
+        if (v->key_count > 0 && pfn_CreateKeyEventWin) {
+            GetKeyboardState(saved_ks);
+            ks_saved = true;
+        }
+#endif
         for (int i = 0; i < v->key_count; i++) {
             KeyQueueEntry* e = &v->key_queue[i];
             /* Map type (0=RawKeyDown,1=KeyDown,2=KeyUp,3=Char) to SDK enum (0=KeyDown,1=KeyUp,2=RawKeyDown,3=Char) */
             unsigned int ul_type = (unsigned int)(e->type == 0 ? 2 : e->type == 1 ? 0 : e->type == 2 ? 1 : 3);
 #ifdef _WIN32
             if (pfn_CreateKeyEventWin && e->type != 3) {
-                /* Use Windows API: properly sets key_identifier, text, unmodified_text.
-                   ulCreateKeyEventWindows reads modifier state via GetKeyState() which
-                   uses the calling thread's key state table. We sync it from our queued
-                   modifier flags so the worker thread produces correct results. */
+                /* Sincronizar modifier flags para este evento */
                 BYTE ks[256];
-                GetKeyboardState(ks);
-                BYTE saved[256];
-                memcpy(saved, ks, 256);
                 memset(ks, 0, 256);
                 if (e->mods & 2)  { ks[VK_CONTROL] = 0x80; ks[VK_LCONTROL] = 0x80; }
                 if (e->mods & 8)  { ks[VK_SHIFT]   = 0x80; ks[VK_LSHIFT]   = 0x80; }
@@ -1055,8 +1114,6 @@ static void worker_do_tick(void) {
                 ULKeyEvent evt = pfn_CreateKeyEventWin((ULKeyEventType)ul_type, (uintptr_t)e->vk, lp, false);
                 pfn_ViewFireKeyEvent(v->view, evt);
                 pfn_DestroyKeyEvent(evt);
-
-                SetKeyboardState(saved);
             } else
 #endif
             {
@@ -1069,6 +1126,12 @@ static void worker_do_tick(void) {
                 pfn_DestroyString(s_umod);
             }
         }
+#ifdef _WIN32
+        /* Restaurar keyboard state original una sola vez despues del loop */
+        if (ks_saved) {
+            SetKeyboardState(saved_ks);
+        }
+#endif
         v->key_count = 0;
         if (v->js_queue) {
             for (int i = 0; i < v->js_count; i++) {
@@ -1531,7 +1594,9 @@ EXPORT int ul_view_get_message(int view_id, char* buf, int buf_size) {
     int cl = len < (buf_size - 1) ? len : (buf_size - 1);
     memcpy(buf, v->msg_queue[v->msg_tail], cl);
     buf[cl] = '\0';
-    v->msg_tail = (v->msg_tail + 1) % MSG_QUEUE_MAX;
+    free(v->msg_queue[v->msg_tail]);
+    v->msg_queue[v->msg_tail] = NULL;
+    v->msg_tail = (v->msg_tail + 1) % v->msg_capacity;
     v->msg_count--;
     return cl;
 }
@@ -1544,7 +1609,9 @@ EXPORT int ul_view_get_console_message(int view_id, char* buf, int buf_size) {
     int cl = len < (buf_size - 1) ? len : (buf_size - 1);
     memcpy(buf, v->console_msgs[v->console_tail], cl);
     buf[cl] = '\0';
-    v->console_tail = (v->console_tail + 1) % CONSOLE_MSG_MAX;
+    free(v->console_msgs[v->console_tail]);
+    v->console_msgs[v->console_tail] = NULL;
+    v->console_tail = (v->console_tail + 1) % v->console_capacity;
     v->console_count--;
     return cl;
 }
