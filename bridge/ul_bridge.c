@@ -255,8 +255,7 @@ static PFN_JSValueToStringCopy                 pfn_JSValueToStringCopy;
 #define SCROLL_QUEUE_MAX   16
 #define KEY_QUEUE_MAX      32
 #define KEY_TEXT_LEN       32
-#define JS_QUEUE_MAX       32
-#define JS_QUEUE_BUFLEN    8192
+#define JS_QUEUE_INITIAL   64
 
 typedef struct { int type, x, y, button; } MouseQueueEntry;
 typedef struct { int type, dx, dy; } ScrollQueueEntry;
@@ -279,8 +278,9 @@ typedef struct {
     int       scroll_count;
     KeyQueueEntry key_queue[KEY_QUEUE_MAX];
     int       key_count;
-    char      js_queue[JS_QUEUE_MAX][JS_QUEUE_BUFLEN];
+    char**    js_queue;
     int       js_count;
+    int       js_capacity;
     /* Native message queue (JS -> Go via __goSend, not console) */
     char      msg_queue[MSG_QUEUE_MAX][MSG_QUEUE_BUFLEN];
     int       msg_lens[MSG_QUEUE_MAX];
@@ -851,6 +851,16 @@ static void worker_do_destroy_view(int vid) {
     v->js_bound = false;
     v->load_phase = 0;
     if (v->pending_load_str) { free(v->pending_load_str); v->pending_load_str = NULL; }
+    /* Liberar cola JS dinamica */
+    if (v->js_queue) {
+        for (int i = 0; i < v->js_count; i++) {
+            free(v->js_queue[i]);
+        }
+        free(v->js_queue);
+        v->js_queue = NULL;
+    }
+    v->js_count = 0;
+    v->js_capacity = 0;
     g_view_count--;
 }
 
@@ -1060,10 +1070,14 @@ static void worker_do_tick(void) {
             }
         }
         v->key_count = 0;
-        for (int i = 0; i < v->js_count; i++) {
-            ULString s = pfn_CreateString(v->js_queue[i]);
-            pfn_ViewEvaluateScript(v->view, s, NULL);
-            pfn_DestroyString(s);
+        if (v->js_queue) {
+            for (int i = 0; i < v->js_count; i++) {
+                ULString s = pfn_CreateString(v->js_queue[i]);
+                pfn_ViewEvaluateScript(v->view, s, NULL);
+                pfn_DestroyString(s);
+                free(v->js_queue[i]);
+                v->js_queue[i] = NULL;
+            }
         }
         v->js_count = 0;
     }
@@ -1490,10 +1504,22 @@ EXPORT void ul_view_fire_key(int view_id, int type, int vk, unsigned int mods, c
 EXPORT void ul_view_eval_js(int view_id, const char* js) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !js) return;
     ViewSlot* v = &g_views[view_id];
-    if (v->js_count >= JS_QUEUE_MAX) return;
-    size_t len = strlen(js);
-    if (len >= JS_QUEUE_BUFLEN) return;
-    memcpy(v->js_queue[v->js_count], js, len + 1);
+    /* Inicializar cola si es necesario */
+    if (!v->js_queue) {
+        v->js_capacity = JS_QUEUE_INITIAL;
+        v->js_queue = (char**)malloc(sizeof(char*) * v->js_capacity);
+        if (!v->js_queue) return;
+    }
+    /* Expandir cola si esta llena (duplicar capacidad) */
+    if (v->js_count >= v->js_capacity) {
+        int new_cap = v->js_capacity * 2;
+        char** new_q = (char**)realloc(v->js_queue, sizeof(char*) * new_cap);
+        if (!new_q) return;
+        v->js_queue = new_q;
+        v->js_capacity = new_cap;
+    }
+    v->js_queue[v->js_count] = strdup(js);
+    if (!v->js_queue[v->js_count]) return;
     v->js_count++;
 }
 

@@ -751,27 +751,14 @@ func (ui *UltralightUI) Send(data interface{}) error {
 	if err != nil {
 		return fmt.Errorf("Send: %w", err)
 	}
-	const prefix = "if(window.go&&typeof window.go.receive==='function')window.go.receive(JSON.parse(\""
-	const suffix = "\"));"
-	// Pre-allocate builder with estimated size to avoid re-allocations
+	// JSON es sintaxis JS valida: embeber directo sin escapar ni JSON.parse.
+	// Evita el loop byte-a-byte de escaping y el doble parsing en JS.
+	const prefix = "if(window.go&&typeof window.go.receive==='function')window.go.receive("
+	const suffix = ");"
 	var sb strings.Builder
-	sb.Grow(len(prefix) + len(jsonBytes) + len(suffix) + 16)
+	sb.Grow(len(prefix) + len(jsonBytes) + len(suffix))
 	sb.WriteString(prefix)
-	// Iterate bytes directly (avoids allocating string(jsonBytes))
-	for _, b := range jsonBytes {
-		switch b {
-		case '\\':
-			sb.WriteString(`\\`)
-		case '"':
-			sb.WriteString(`\"`)
-		case '\n':
-			sb.WriteString(`\n`)
-		case '\r':
-			sb.WriteString(`\r`)
-		default:
-			sb.WriteByte(b)
-		}
-	}
+	sb.Write(jsonBytes)
 	sb.WriteString(suffix)
 	evalJS(ui.viewID, sb.String())
 	return nil
