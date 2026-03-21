@@ -99,6 +99,9 @@ typedef void         (*PFN_ulViewFocus)(ULView);
 typedef ULString     (*PFN_ulViewEvaluateScript)(ULView, ULString, ULString*);
 typedef void (*ULConsoleCallback)(void*, ULView, ULMessageSource, ULMessageLevel, ULString, unsigned int, unsigned int, ULString);
 typedef void (*PFN_ulViewSetConsoleCallback)(ULView, ULConsoleCallback, void*);
+/* DOMReady callback: fired when DOMContentLoaded triggers (JS context is stable) */
+typedef void (*ULDOMReadyCallback)(void*, ULView, unsigned long long, bool, ULString);
+typedef void (*PFN_ulViewSetDOMReadyCallback)(ULView, ULDOMReadyCallback, void*);
 typedef ULMouseEvent  (*PFN_ulCreateMouseEvent)(int, int, int, int);
 typedef void          (*PFN_ulDestroyMouseEvent)(ULMouseEvent);
 typedef void          (*PFN_ulViewFireMouseEvent)(ULView, ULMouseEvent);
@@ -177,6 +180,9 @@ typedef JSObjectRef  (*PFN_JSObjectMakeFunctionWithCallback)(JSContextRef, JSStr
 typedef void         (*PFN_JSObjectSetProperty)(JSContextRef, JSObjectRef, JSStringRef, JSValueRef, unsigned int, JSValueRef*);
 typedef bool         (*PFN_JSValueIsString)(JSContextRef, JSValueRef);
 typedef JSStringRef  (*PFN_JSValueToStringCopy)(JSContextRef, JSValueRef, JSValueRef*);
+/* JSEvaluateScript: evaluate JS in a specific locked context (bypasses ulViewEvaluateScript
+ * which on macOS may target the wrong view's context). */
+typedef JSValueRef   (*PFN_JSEvaluateScript)(JSContextRef, JSStringRef, JSObjectRef, JSStringRef, int, JSValueRef*);
 
 static PFN_ulCreateString              pfn_CreateString;
 static PFN_ulDestroyString             pfn_DestroyString;
@@ -204,6 +210,7 @@ static PFN_ulViewGetSurface            pfn_ViewGetSurface;
 static PFN_ulViewFocus                 pfn_ViewFocus;
 static PFN_ulViewEvaluateScript        pfn_ViewEvaluateScript;
 static PFN_ulViewSetConsoleCallback    pfn_ViewSetConsoleCallback;
+static PFN_ulViewSetDOMReadyCallback   pfn_ViewSetDOMReadyCallback;
 static PFN_ulViewFireMouseEvent        pfn_ViewFireMouseEvent;
 static PFN_ulViewFireScrollEvent       pfn_ViewFireScrollEvent;
 static PFN_ulViewFireKeyEvent          pfn_ViewFireKeyEvent;
@@ -244,6 +251,7 @@ static PFN_JSObjectMakeFunctionWithCallback    pfn_JSObjectMakeFunctionWithCallb
 static PFN_JSObjectSetProperty                 pfn_JSObjectSetProperty;
 static PFN_JSValueIsString                     pfn_JSValueIsString;
 static PFN_JSValueToStringCopy                 pfn_JSValueToStringCopy;
+static PFN_JSEvaluateScript                    pfn_JSEvaluateScript;
 
 /* ── Queue and view constants ────────────────────────────────────── */
 #define MAX_VIEWS 16
@@ -292,7 +300,13 @@ typedef struct {
     char*     pending_load_str;   /* URL or HTML to load after priming (strdup'd) */
     bool      pending_is_url;
     bool      js_bound;           /* true if setup_js_bindings completed successfully */
-    JSContextRef cached_ctx;    /* cached JSC context for callback matching */
+    /* Actual surface dimensions (may differ from width/height on HiDPI) */
+    int       surface_width;
+    int       surface_height;
+    /* Binding retry state */
+    int       bind_count;         /* how many times setup_js_bindings succeeded */
+    int       msg_count_total;    /* how many messages received via goSend_dispatch */
+    int       rebind_tick;        /* tick counter for spacing out binding retries */
 } ViewSlot;
 
 /* ── Circular queue helpers (dynamic) ────────────────────────────────── */
@@ -628,9 +642,9 @@ static void console_message_cb(void* user_data, ULView caller, ULMessageSource s
     char* data = pfn_StringGetData(message);
     size_t len = pfn_StringGetLength(message);
     if (!data || len == 0) return;
-    /* Lazy init */
+
+    /* Console message → console_queue */
     if (!v->console_msgs && !circ_queue_init(&v->console_msgs, &v->console_lens, &v->console_capacity)) return;
-    /* Grow if full */
     if (v->console_count >= v->console_capacity) {
         if (!circ_queue_grow(&v->console_msgs, &v->console_lens, &v->console_capacity,
                              v->console_count, &v->console_tail, &v->console_head)) return;
@@ -684,6 +698,8 @@ static int resolve_functions(void) {
     RESOLVE(g_hUltralight, pfn_ViewFocus, "ulViewFocus");
     RESOLVE(g_hUltralight, pfn_ViewEvaluateScript, "ulViewEvaluateScript");
     RESOLVE(g_hUltralight, pfn_ViewSetConsoleCallback, "ulViewSetAddConsoleMessageCallback");
+    /* Opcional: DOMReady callback para re-bind JS bindings despues de page load */
+    *(void**)&pfn_ViewSetDOMReadyCallback = GETSYM(g_hUltralight, "ulViewSetAddDOMReadyCallback");
     RESOLVE(g_hUltralight, pfn_ViewFireMouseEvent, "ulViewFireMouseEvent");
     RESOLVE(g_hUltralight, pfn_ViewFireScrollEvent, "ulViewFireScrollEvent");
     RESOLVE(g_hUltralight, pfn_ViewFireKeyEvent, "ulViewFireKeyEvent");
@@ -729,29 +745,30 @@ static int resolve_functions(void) {
     RESOLVE(g_hWebCore, pfn_JSObjectSetProperty, "JSObjectSetProperty");
     RESOLVE(g_hWebCore, pfn_JSValueIsString, "JSValueIsString");
     RESOLVE(g_hWebCore, pfn_JSValueToStringCopy, "JSValueToStringCopy");
+    /* Opcional: JSEvaluateScript permite evaluar JS en un contexto locked especifico,
+     * evitando que ulViewEvaluateScript apunte al view incorrecto en macOS. */
+    *(void**)&pfn_JSEvaluateScript = GETSYM(g_hWebCore, "JSEvaluateScript");
+    blog("JSContextGetGlobalContext: %s", pfn_JSContextGetGlobalContext ? "found" : "NOT found");
+    blog("JSEvaluateScript: %s", pfn_JSEvaluateScript ? "found" : "NOT found (fallback to ulViewEvaluateScript)");
+    blog("DOMReadyCallback: %s", pfn_ViewSetDOMReadyCallback ? "found" : "NOT found");
     return 0;
 }
 #undef RESOLVE
 #undef GETSYM
 
-/* JSC native callback: invoked when JS calls window.__goSend(msg).
- * Runs on the worker thread. */
-static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
-    JSObjectRef thisObject, size_t argumentCount, const JSValueRef arguments[], JSValueRef* exception) {
-    /* Normalizar execution context -> global context para matching */
-    JSContextRef globalCtx = pfn_JSContextGetGlobalContext ? pfn_JSContextGetGlobalContext(ctx) : ctx;
-    int vid = -1;
-    for (int i = 0; i < MAX_VIEWS; i++) {
-        if (g_views[i].used && g_views[i].view && g_views[i].cached_ctx == globalCtx) {
-            vid = i; break;
-        }
+/* Dispatch function: handles __goSend message for a known view ID.
+ * Called by per-view callbacks that embed the view ID directly,
+ * eliminating unreliable JSC context pointer matching (broken on macOS). */
+static JSValueRef goSend_dispatch(int vid, JSContextRef ctx, size_t argumentCount, const JSValueRef arguments[]) {
+    if (vid < 0 || vid >= MAX_VIEWS || !g_views[vid].used) {
+        blog("goSend_dispatch: invalid vid=%d", vid);
+        return NULL;
     }
-    if (vid < 0) { blog("jsc_goSend_callback: no matching view for ctx=%p global=%p", (void*)ctx, (void*)globalCtx); return NULL; }
-    if (argumentCount < 1) { blog("jsc_goSend_callback: no args"); return NULL; }
+    if (argumentCount < 1) { blog("goSend_dispatch: vid=%d no args", vid); return NULL; }
 
     /* Convert first argument to UTF-8 */
     JSStringRef jsStr = pfn_JSValueToStringCopy(ctx, arguments[0], NULL);
-    if (!jsStr) { blog("jsc_goSend_callback: JSValueToStringCopy failed"); return NULL; }
+    if (!jsStr) { blog("goSend_dispatch: vid=%d JSValueToStringCopy failed", vid); return NULL; }
 
     size_t maxLen = pfn_JSStringGetMaximumUTF8CStringSize(jsStr);
     ViewSlot* v = &g_views[vid];
@@ -765,7 +782,7 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     if (v->msg_count >= v->msg_capacity) {
         if (!circ_queue_grow(&v->msg_queue, &v->msg_lens, &v->msg_capacity,
                              v->msg_count, &v->msg_tail, &v->msg_head)) {
-            blog("jsc_goSend_callback: grow failed");
+            blog("goSend_dispatch: vid=%d grow failed", vid);
             pfn_JSStringRelease(jsStr);
             return NULL;
         }
@@ -778,41 +795,131 @@ static JSValueRef jsc_goSend_callback(JSContextRef ctx, JSObjectRef function,
     v->msg_lens[v->msg_head] = (int)written;
     v->msg_head = (v->msg_head + 1) % v->msg_capacity;
     v->msg_count++;
-    blog("jsc_goSend_callback: vid=%d len=%d", vid, (int)written);
+    v->msg_count_total++;
+    blog("goSend_dispatch: vid=%d msg#%d len=%d", vid, v->msg_count_total, (int)written);
     pfn_JSStringRelease(jsStr);
     return NULL;
 }
 
+/* Per-view JSC callbacks: each one knows its view ID at compile time.
+ * This eliminates the need to match JSC context pointers (which is
+ * unreliable on macOS where JSContextGetGlobalContext returns a
+ * different pointer than ViewLockJSContext, causing random failures). */
+#define DEFINE_GOSEND_CB(N) \
+    static JSValueRef goSend_cb_##N(JSContextRef ctx, JSObjectRef function, \
+        JSObjectRef thisObject, size_t argumentCount, const JSValueRef arguments[], JSValueRef* exception) { \
+        return goSend_dispatch(N, ctx, argumentCount, arguments); \
+    }
+
+DEFINE_GOSEND_CB(0)
+DEFINE_GOSEND_CB(1)
+DEFINE_GOSEND_CB(2)
+DEFINE_GOSEND_CB(3)
+DEFINE_GOSEND_CB(4)
+DEFINE_GOSEND_CB(5)
+DEFINE_GOSEND_CB(6)
+DEFINE_GOSEND_CB(7)
+DEFINE_GOSEND_CB(8)
+DEFINE_GOSEND_CB(9)
+DEFINE_GOSEND_CB(10)
+DEFINE_GOSEND_CB(11)
+DEFINE_GOSEND_CB(12)
+DEFINE_GOSEND_CB(13)
+DEFINE_GOSEND_CB(14)
+DEFINE_GOSEND_CB(15)
+
+/* Dispatch table: maps view ID -> per-view callback function */
+typedef JSValueRef (*JSGoSendFn)(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSGoSendFn goSend_callbacks[MAX_VIEWS] = {
+    goSend_cb_0,  goSend_cb_1,  goSend_cb_2,  goSend_cb_3,
+    goSend_cb_4,  goSend_cb_5,  goSend_cb_6,  goSend_cb_7,
+    goSend_cb_8,  goSend_cb_9,  goSend_cb_10, goSend_cb_11,
+    goSend_cb_12, goSend_cb_13, goSend_cb_14, goSend_cb_15,
+};
+
 /* Register window.__goSend and window.go.send as native JSC functions.
  * Must be called on the worker thread when the JS context is ready.
+ * Uses per-view callback from dispatch table (no context pointer matching).
+ *
+ * CRITICAL macOS fix: pfn_ViewLockJSContext returns different "execution contexts"
+ * each call (~5 cycling pointers). JSContextGetGlobalContext normalizes any
+ * execution context to the stable global context for the view. Without this,
+ * __goSend may be registered on a transient context that doesn't persist,
+ * causing random per-view button failures.
+ *
  * Returns true if bindings were set up, false if context not ready. */
 static bool setup_js_bindings(int vid) {
     if (vid < 0 || vid >= MAX_VIEWS || !g_views[vid].used) return false;
     ViewSlot* v = &g_views[vid];
 
-    JSContextRef ctx = pfn_ViewLockJSContext(v->view);
-    if (!ctx) return false;
+    JSContextRef rawCtx = pfn_ViewLockJSContext(v->view);
+    if (!rawCtx) {
+        blog("setup_js_bindings: vid=%d ctx=NULL (FAIL)", vid);
+        return false;
+    }
 
-    /* Cachear el contexto para matching en el callback */
-    v->cached_ctx = ctx;
+    /* Normalize execution context to global context (stable per-view).
+     * On macOS, pfn_ViewLockJSContext returns cycling execution contexts.
+     * JSContextGetGlobalContext maps any of them to the single stable
+     * global context for this view's JS environment. */
+    JSContextRef ctx = rawCtx;
+    if (pfn_JSContextGetGlobalContext) {
+        ctx = pfn_JSContextGetGlobalContext(rawCtx);
+    }
 
     JSObjectRef global = pfn_JSContextGetGlobalObject(ctx);
 
-    /* Register window.__goSend */
+    /* Register window.__goSend using per-view callback (eliminates context matching) */
     JSStringRef fnName = pfn_JSStringCreateWithUTF8CString("__goSend");
-    JSObjectRef fnObj = pfn_JSObjectMakeFunctionWithCallback(ctx, fnName, jsc_goSend_callback);
+    JSObjectRef fnObj = pfn_JSObjectMakeFunctionWithCallback(ctx, fnName, goSend_callbacks[vid]);
     pfn_JSObjectSetProperty(ctx, global, fnName, fnObj, 0, NULL);
     pfn_JSStringRelease(fnName);
 
+    /* Set up window.go namespace via JSEvaluateScript in the normalized context */
+    if (pfn_JSEvaluateScript) {
+        JSStringRef script = pfn_JSStringCreateWithUTF8CString(
+            "window.go=window.go||{};window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};");
+        pfn_JSEvaluateScript(ctx, script, NULL, NULL, 0, NULL);
+        pfn_JSStringRelease(script);
+    }
+
     pfn_ViewUnlockJSContext(v->view);
 
-    /* Set up window.go namespace (preserve existing props) */
-    ULString goNs = pfn_CreateString("window.go=window.go||{};window.go.send=window.__goSend;");
-    pfn_ViewEvaluateScript(v->view, goNs, NULL);
-    pfn_DestroyString(goNs);
+    /* Fallback: si JSEvaluateScript no esta disponible, usar ulViewEvaluateScript */
+    if (!pfn_JSEvaluateScript) {
+        ULString goNs = pfn_CreateString("window.go=window.go||{};window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};");
+        pfn_ViewEvaluateScript(v->view, goNs, NULL);
+        pfn_DestroyString(goNs);
+    }
+
     v->js_bound = true;
-    blog("setup_js_bindings: vid=%d done", vid);
+    v->bind_count++;
+    blog("setup_js_bindings: vid=%d OK #%d (raw=%p, global=%p, JSEval=%s)",
+         vid, v->bind_count, (void*)rawCtx, (void*)ctx,
+         pfn_JSEvaluateScript ? "JSC" : "ulView");
     return true;
+}
+
+/* DOMReady callback: fired when the page's DOMContentLoaded event triggers.
+ * At this point the JS context is stable (no more resets from page loading).
+ * Re-establishes __goSend bindings that may have been wiped by the page load.
+ * common.js queues messages and retries every 50ms, so once we bind here,
+ * the pending 'ready' message (and any others) will be flushed automatically. */
+static void dom_ready_cb(void* user_data, ULView caller, unsigned long long frame_id,
+                         bool is_main_frame, ULString url) {
+    if (!is_main_frame) return;
+    int vid = (int)(intptr_t)user_data;
+    if (vid < 0 || vid >= MAX_VIEWS || !g_views[vid].used) return;
+    blog("dom_ready_cb: vid=%d fired (frame=%llu), re-binding JS", vid, frame_id);
+    g_views[vid].js_bound = false;
+    setup_js_bindings(vid);
+}
+
+/* Register DOMReady callback on a view (if available in this SDK version) */
+static void register_dom_ready(int vid) {
+    if (pfn_ViewSetDOMReadyCallback && vid >= 0 && vid < MAX_VIEWS && g_views[vid].view) {
+        pfn_ViewSetDOMReadyCallback(g_views[vid].view, dom_ready_cb, (void*)(intptr_t)vid);
+    }
 }
 
 static int worker_do_init(void) {
@@ -881,12 +988,22 @@ static int worker_do_create_view(int width, int height) {
     v->surface = pfn_ViewGetSurface(v->view);
     v->width = width;
     v->height = height;
+    v->surface_width = v->surface ? (int)pfn_SurfaceGetWidth(v->surface) : width;
+    v->surface_height = v->surface ? (int)pfn_SurfaceGetHeight(v->surface) : height;
+    if (v->surface_width != width || v->surface_height != height) {
+        blog("worker_do_create_view: DPI mismatch! requested=%dx%d surface=%dx%d",
+             width, height, v->surface_width, v->surface_height);
+    }
     v->used = true;
     v->js_bound = false;
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->bind_count = 0;
+    v->msg_count_total = 0;
+    v->rebind_tick = 0;
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
+    register_dom_ready(vid);
     pfn_ViewFocus(v->view);
     g_view_count++;
     /* Single update cycle, no sleeping — pfn_Update processes synchronously */
@@ -953,12 +1070,18 @@ static int worker_do_create_and_load(int width, int height, const char* str, boo
     v->surface = pfn_ViewGetSurface(v->view);
     v->width = width;
     v->height = height;
+    v->surface_width = v->surface ? (int)pfn_SurfaceGetWidth(v->surface) : width;
+    v->surface_height = v->surface ? (int)pfn_SurfaceGetHeight(v->surface) : height;
     v->used = true;
     v->js_bound = false;
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->bind_count = 0;
+    v->msg_count_total = 0;
+    v->rebind_tick = 0;
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
+    register_dom_ready(vid);
     pfn_ViewFocus(v->view);
     g_view_count++;
     /* Guardar contenido para carga diferida */
@@ -988,15 +1111,21 @@ static int worker_do_create_with_content(int width, int height, const char* cont
     v->surface = pfn_ViewGetSurface(v->view);
     v->width = width;
     v->height = height;
+    v->surface_width = v->surface ? (int)pfn_SurfaceGetWidth(v->surface) : width;
+    v->surface_height = v->surface ? (int)pfn_SurfaceGetHeight(v->surface) : height;
     v->used = true;
     v->js_bound = false;
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->bind_count = 0;
+    v->msg_count_total = 0;
+    v->rebind_tick = 0;
     v->load_phase = 0;
     v->phase_counter = 0;
     v->pending_load_str = NULL;
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
+    register_dom_ready(vid);
     pfn_ViewFocus(v->view);
     g_view_count++;
     /* Load content immediately */
@@ -1008,7 +1137,8 @@ static int worker_do_create_with_content(int width, int height, const char* cont
     }
     /* Minimal processing: one update to kick off parsing.
      * Render is deferred to the next ul_tick() call for maximum speed.
-     * JS bindings are set up after the update so the context is ready. */
+     * JS bindings are set up after the update so the context is ready.
+     * NOTE: DOMReady callback will re-bind after page load completes. */
     pfn_Update(g_renderer);
     setup_js_bindings(vid);
     blog("worker_do_create_with_content: vid=%d", vid);
@@ -1047,9 +1177,6 @@ static void worker_do_tick(void) {
     for (int vid = 0; vid < MAX_VIEWS; vid++) {
         ViewSlot* v = &g_views[vid];
         if (!v->used || !v->view) continue;
-        /* Retry JS bindings if they weren't set up during fast creation */
-        if (!v->js_bound && v->load_phase == 0)
-            setup_js_bindings(vid);
         /* Mouse coalescing: only send the last MOVED, but keep all DOWN/UP events.
            When the cursor moves fast, many redundant MOVED events accumulate;
            only the final position matters for hover/CSS. */
@@ -1067,8 +1194,10 @@ static void worker_do_tick(void) {
                 /* Clamping: only for coords inside the viewport. Negative coordinates
                    are sent intentionally for mouse-leave (to clear :hover). */
                 if (x >= 0 && y >= 0) {
-                    if (v->width > 0 && x >= v->width) x = v->width - 1;
-                    if (v->height > 0 && y >= v->height) y = v->height - 1;
+                    int clampW = v->surface_width > 0 ? v->surface_width : v->width;
+                    int clampH = v->surface_height > 0 ? v->surface_height : v->height;
+                    if (clampW > 0 && x >= clampW) x = clampW - 1;
+                    if (clampH > 0 && y >= clampH) y = clampH - 1;
                 }
                 ULMouseEvent evt = pfn_CreateMouseEvent(e->type, x, y, e->button);
                 pfn_ViewFireMouseEvent(v->view, evt);
@@ -1134,6 +1263,9 @@ static void worker_do_tick(void) {
 #endif
         v->key_count = 0;
         if (v->js_queue) {
+            /* Use ulViewEvaluateScript(view, ...) which targets the correct view
+             * via its ULView handle. Do NOT use JSEvaluateScript with locked context
+             * because pfn_ViewLockJSContext returns incorrect context pointers on macOS. */
             for (int i = 0; i < v->js_count; i++) {
                 ULString s = pfn_CreateString(v->js_queue[i]);
                 pfn_ViewEvaluateScript(v->view, s, NULL);
@@ -1143,6 +1275,21 @@ static void worker_do_tick(void) {
             }
         }
         v->js_count = 0;
+    }
+    /* Safety: re-try JS bindings ONLY for views that haven't received
+     * any messages yet. Once a message arrives (or DOMReady fires and
+     * rebinds), we stop — continued rebinding on macOS can corrupt the
+     * view's JS state because ViewLockJSContext returns cycling context
+     * pointers, and evaluating JS on a wrong context breaks event handlers.
+     * Retry every 60 ticks (~1s at 60fps), max 10 attempts. */
+    for (int vid = 0; vid < MAX_VIEWS; vid++) {
+        ViewSlot* v = &g_views[vid];
+        if (!v->used || !v->view || v->load_phase != 0) continue;
+        if (v->msg_count_total > 0) continue; /* bindings work, stop retrying */
+        v->rebind_tick++;
+        if (v->bind_count > 0 && v->bind_count < 10 && v->rebind_tick % 60 == 0) {
+            setup_js_bindings(vid);
+        }
     }
     pfn_Update(g_renderer);
     if (pfn_RefreshDisplay) pfn_RefreshDisplay(g_renderer, 0);
@@ -1532,6 +1679,18 @@ EXPORT int ul_view_copy_pixels_rgba(int view_id, unsigned char* dest, int dest_s
     pfn_SurfaceUnlockPixels(v->surface);
     pfn_SurfaceClearDirtyBounds(v->surface);
     return 1;
+}
+
+/* Returns the actual surface width (may differ from requested on HiDPI) */
+EXPORT int ul_view_get_surface_width(int view_id) {
+    if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return 0;
+    return g_views[view_id].surface_width;
+}
+
+/* Returns the actual surface height (may differ from requested on HiDPI) */
+EXPORT int ul_view_get_surface_height(int view_id) {
+    if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return 0;
+    return g_views[view_id].surface_height;
 }
 
 EXPORT void ul_view_fire_mouse(int view_id, int type, int x, int y, int button) {

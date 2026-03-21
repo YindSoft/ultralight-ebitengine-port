@@ -73,6 +73,8 @@ var (
 	ulViewCopyPixelsRGBA    func(viewID int32, dest uintptr, destSize int32) int32
 	ulCreateViewWithHTML    func(width, height int32, html string) int32
 	ulCreateViewWithURL     func(width, height int32, url string) int32
+	ulViewGetSurfaceWidth   func(viewID int32) int32
+	ulViewGetSurfaceHeight  func(viewID int32) int32
 )
 
 var (
@@ -155,6 +157,8 @@ func resolveAllSymbols(handle uintptr) error {
 		{&ulViewCopyPixelsRGBA, "ul_view_copy_pixels_rgba"},
 		{&ulCreateViewWithHTML, "ul_create_view_with_html"},
 		{&ulCreateViewWithURL, "ul_create_view_with_url"},
+		{&ulViewGetSurfaceWidth, "ul_view_get_surface_width"},
+		{&ulViewGetSurfaceHeight, "ul_view_get_surface_height"},
 	} {
 		sym, err := getSymbolAddr(handle, reg.name)
 		if err != nil {

@@ -1,6 +1,6 @@
 module github.com/YindSoft/ultralight-ebitengine-port
 
-go 1.26.0
+go 1.25.4
 
 require (
 	github.com/ebitengine/purego v0.10.0

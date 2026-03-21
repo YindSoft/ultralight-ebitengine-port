@@ -6,6 +6,7 @@ package ultralightui
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,18 @@ func init() {
 // (e.g., a border + topbar offset the content).
 var GlobalCursorOffsetX int
 var GlobalCursorOffsetY int
+
+// DebugInput enables coordinate logging in forwardInput(). When true, every
+// mouse click logs the full coordinate chain (cursor, offset, bounds, local)
+// to stdout via log.Printf. Useful for diagnosing input issues on specific platforms.
+var DebugInput bool
+
+// MouseCoordScale overrides the auto-detected mouse coordinate scale factor.
+// 0 (default) = auto-detect from surface dimensions.
+// >0 = manual scale applied to local coordinates before sending to Ultralight.
+// On macOS Retina, Ultralight may expect coordinates at 2x even when the
+// view's device scale is set to 1.0. Set to 2.0 to fix click misalignment.
+var MouseCoordScale float64
 
 // ClearFocus removes keyboard focus from all views. After this call,
 // no UI receives key events (keys go back to the game).
@@ -90,6 +103,11 @@ type UltralightUI struct {
 	// Reusable buffers to avoid per-frame allocations in forwardKeyboard
 	keyBuf     []ebiten.Key
 	charBuf    []rune
+
+	// mouseScale is the ratio of actual surface size to requested size.
+	// Used to scale mouse coordinates for HiDPI (e.g., macOS Retina where
+	// the surface may be 2x despite deviceScale=1.0). Auto-detected.
+	mouseScale float64
 
 	// OnMessage is called when the page sends a message via go.send(msg).
 	// msg is a string or JSON string. Use ParseMessage to get structured data.
@@ -158,6 +176,7 @@ func newUI(width, height int, html []byte) (*UltralightUI, error) {
 		width:   width,
 		height:  height,
 	}
+	ui.detectMouseScale()
 	return ui, nil
 }
 
@@ -176,6 +195,7 @@ func newUIWithURL(width, height int, url string) (*UltralightUI, error) {
 		width:   width,
 		height:  height,
 	}
+	ui.detectMouseScale()
 	return ui, nil
 }
 
@@ -215,15 +235,12 @@ func (ui *UltralightUI) SetBounds(x, y, w, h int) {
 // every frame when Ultralight has pending changes.
 func (ui *UltralightUI) MarkDirty() {}
 
-// injectGoHelper ensures the window.go namespace is set up. The native __goSend
-// function is registered by the C bridge via JavaScriptCore. This ensures
-// go.send wraps it with JSON serialization for non-string values.
-// It also installs a custom undo/redo system for input/textarea elements,
+// injectGoHelper installs a custom undo/redo system for input/textarea elements,
 // triggered from Go via ui.Eval("__ulUndo()") / "__ulRedo()" / "__ulSelectAll()".
+// JS→Go messaging uses the native __goSend JSC callback registered by the C bridge
+// in setup_js_bindings(). common.js wraps it as window.go.send().
 func (ui *UltralightUI) injectGoHelper() {
-	// Single combined Eval: go.send setup + undo/redo/selectAll
-	ui.Eval(`if(typeof window.__goSend==='function'){window.go=window.go||{};if(!window.go.send)window.go.send=function(m){window.__goSend(typeof m==='string'?m:JSON.stringify(m));};}
-(function(){
+	ui.Eval(`(function(){
 if(window.__ulUndoInit)return;window.__ulUndoInit=1;
 var stacks=new WeakMap(),redos=new WeakMap(),skip=0;
 function S(e){if(!stacks.has(e))stacks.set(e,[{v:e.value,s:e.selectionStart,e:e.selectionEnd}]);return stacks.get(e)}
@@ -349,20 +366,48 @@ func (ui *UltralightUI) inBounds(mx, my int) bool {
 
 func (ui *UltralightUI) forwardInput() {
 	mx, my := ebiten.CursorPosition()
+	rawMx, rawMy := mx, my // guardamos para debug
 	mx -= GlobalCursorOffsetX
 	my -= GlobalCursorOffsetY
 	inBounds := ui.inBounds(mx, my)
 
-	if inBounds && inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
-		setFocusedViewID(ui.viewID)
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		if inBounds {
+			setFocusedViewID(ui.viewID)
+		} else if getFocusedViewID() == ui.viewID {
+			// Click fuera de esta vista que tenia foco: liberar foco para que
+			// las teclas (flechas, etc.) no sigan llegando al HTML.
+			setFocusedViewID(-1)
+		}
 	}
 
-	if inBounds {
-		ui.mouseInside = true
+	// "Mouse capture": si el press inicio dentro de esta vista, seguimos
+	// reenviando eventos aunque el cursor salga de los bounds, hasta que
+	// se suelte el boton (igual que el comportamiento nativo de un browser).
+	captured := ui.leftDown || ui.rightDown
+
+	if inBounds || captured {
+		if inBounds {
+			ui.mouseInside = true
+		}
 		lx := mx - ui.BoundsX
 		ly := my - ui.BoundsY
 		if ui.BoundsW <= 0 {
 			lx, ly = mx, my
+		}
+
+		// Escalar coordenadas locales para HiDPI (macOS Retina u otros)
+		scale := ui.getMouseScale()
+		if scale > 1.0 {
+			lx = int(float64(lx) * scale)
+			ly = int(float64(ly) * scale)
+		}
+
+		// Debug logging: solo en clicks para no spamear
+		if DebugInput && inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+			log.Printf("[ultralightui] click viewID=%d cursor=(%d,%d) offset=(%d,%d) adjusted=(%d,%d) bounds=(%d,%d,%d,%d) local=(%d,%d) scale=%.1f",
+				ui.viewID, rawMx, rawMy, GlobalCursorOffsetX, GlobalCursorOffsetY,
+				mx, my, ui.BoundsX, ui.BoundsY, ui.BoundsW, ui.BoundsH, lx, ly, scale)
 		}
 
 		if lx != ui.mouseX || ly != ui.mouseY {
@@ -376,43 +421,71 @@ func (ui *UltralightUI) forwardInput() {
 			ui.mouseY = ly
 		}
 
-		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
-			if !ui.leftDown && !ui.leftOutside {
+		// Left button — use JustPressed to catch sub-frame clicks (macOS trackpad)
+		justPressedLeft := inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft)
+		pressedLeft := ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
+
+		// Solo iniciar press nuevo si estamos dentro de bounds (no si solo captured)
+		if inBounds {
+			if justPressedLeft && !ui.leftDown && !ui.leftOutside {
 				ui.leftDown = true
 				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonLeft)
-	
+			} else if pressedLeft && !ui.leftDown && !ui.leftOutside {
+				// Button held from previous frame without JustPressed (edge case)
+				ui.leftDown = true
+				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonLeft)
 			}
-		} else {
+		}
+
+		if !pressedLeft {
 			if ui.leftDown {
 				ui.leftDown = false
 				ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonLeft)
-	
 			}
 			ui.leftOutside = false
 		}
 
-		if ebiten.IsMouseButtonPressed(ebiten.MouseButtonRight) {
-			if !ui.rightDown && !ui.rightOutside {
+		// Right button — same pattern
+		justPressedRight := inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonRight)
+		pressedRight := ebiten.IsMouseButtonPressed(ebiten.MouseButtonRight)
+
+		if inBounds {
+			if justPressedRight && !ui.rightDown && !ui.rightOutside {
 				ui.rightDown = true
 				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonRight)
-	
+			} else if pressedRight && !ui.rightDown && !ui.rightOutside {
+				ui.rightDown = true
+				ulViewFireMouse(ui.viewID, mouseEventTypeDown, int32(lx), int32(ly), mouseButtonRight)
 			}
-		} else {
+		}
+
+		if !pressedRight {
 			if ui.rightDown {
 				ui.rightDown = false
 				ulViewFireMouse(ui.viewID, mouseEventTypeUp, int32(lx), int32(ly), mouseButtonRight)
-	
 			}
 			ui.rightOutside = false
 		}
 
-		_, scrollY := ebiten.Wheel()
-		if scrollY != 0 {
-			ulViewFireScroll(ui.viewID, scrollEventTypeByPixel, 0, int32(scrollY*100))
+		// Scroll solo dentro de bounds
+		if inBounds {
+			_, scrollY := ebiten.Wheel()
+			if scrollY != 0 {
+				ulViewFireScroll(ui.viewID, scrollEventTypeByPixel, 0, int32(scrollY*100))
+			}
+		}
 
+		// Si termino la captura y estamos fuera de bounds, enviar leave
+		if !inBounds && !ui.leftDown && !ui.rightDown {
+			if ui.mouseInside {
+				ui.mouseInside = false
+				ulViewFireMouse(ui.viewID, mouseEventTypeMoved, -1, -1, mouseButtonNone)
+				ui.mouseX = -1
+				ui.mouseY = -1
+			}
 		}
 	} else {
-		// Cursor left bounds: send mouse move outside the view to clear :hover
+		// Cursor fuera de bounds y sin captura
 		if ui.mouseInside {
 			ui.mouseInside = false
 			ulViewFireMouse(ui.viewID, mouseEventTypeMoved, -1, -1, mouseButtonNone)
@@ -762,6 +835,49 @@ func (ui *UltralightUI) Send(data interface{}) error {
 	sb.WriteString(suffix)
 	evalJS(ui.viewID, sb.String())
 	return nil
+}
+
+// SurfaceSize returns the actual surface dimensions as reported by Ultralight.
+// On standard displays this matches (width, height). On HiDPI displays the
+// surface may be larger (e.g., 2x on macOS Retina).
+func (ui *UltralightUI) SurfaceSize() (int, int) {
+	if ui.closed {
+		return ui.width, ui.height
+	}
+	sw := int(ulViewGetSurfaceWidth(ui.viewID))
+	sh := int(ulViewGetSurfaceHeight(ui.viewID))
+	if sw <= 0 {
+		sw = ui.width
+	}
+	if sh <= 0 {
+		sh = ui.height
+	}
+	return sw, sh
+}
+
+// detectMouseScale auto-detects the DPI scale factor by comparing the actual
+// surface size with the requested size. If they differ, the ratio is stored
+// as mouseScale so coordinates can be scaled in forwardInput().
+func (ui *UltralightUI) detectMouseScale() {
+	sw, _ := ui.SurfaceSize()
+	if sw > 0 && ui.width > 0 && sw != ui.width {
+		ui.mouseScale = float64(sw) / float64(ui.width)
+		log.Printf("ultralightui: DPI scale auto-detected: %.1fx (surface=%d, requested=%d)", ui.mouseScale, sw, ui.width)
+	} else {
+		ui.mouseScale = 1.0
+	}
+}
+
+// getMouseScale returns the effective mouse coordinate scale factor.
+// Uses MouseCoordScale (manual override) if set, otherwise the auto-detected value.
+func (ui *UltralightUI) getMouseScale() float64 {
+	if MouseCoordScale > 0 {
+		return MouseCoordScale
+	}
+	if ui.mouseScale > 0 {
+		return ui.mouseScale
+	}
+	return 1.0
 }
 
 // IsReady returns true if the view has finished async loading and is usable.

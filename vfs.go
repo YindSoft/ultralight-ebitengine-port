@@ -97,6 +97,7 @@ func NewFromFS(width, height int, mainFile string, fsys fs.FS, opts *Options) (*
 		width:   width,
 		height:  height,
 	}
+	ui.detectMouseScale()
 
 	return ui, nil
 }
@@ -151,6 +152,7 @@ func NewFromFSAsync(width, height int, mainFile string, fsys fs.FS, opts *Option
 		width:   width,
 		height:  height,
 	}
+	ui.detectMouseScale()
 
 	return ui, nil
 }
