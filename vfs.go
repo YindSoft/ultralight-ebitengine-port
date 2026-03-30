@@ -53,6 +53,9 @@ func VFSFileCount() int {
 //	var uiFiles embed.FS
 //	ui, err := ultralightui.NewFromFS(800, 600, "ui/index.html", uiFiles, nil)
 func NewFromFS(width, height int, mainFile string, fsys fs.FS, opts *Options) (*UltralightUI, error) {
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid dimensions: %dx%d", width, height)
+	}
 	baseDir, debug := resolveOpts(opts)
 	if err := initBridge(baseDir); err != nil {
 		return nil, fmt.Errorf("bridge: %w", err)
@@ -108,6 +111,9 @@ func NewFromFS(width, height int, mainFile string, fsys fs.FS, opts *Options) (*
 // Update() can be called immediately; it handles the async state gracefully.
 // Pixel output will be empty/transparent until the view is ready.
 func NewFromFSAsync(width, height int, mainFile string, fsys fs.FS, opts *Options) (*UltralightUI, error) {
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid dimensions: %dx%d", width, height)
+	}
 	baseDir, debug := resolveOpts(opts)
 	if err := initBridge(baseDir); err != nil {
 		return nil, fmt.Errorf("bridge: %w", err)

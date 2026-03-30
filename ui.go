@@ -57,6 +57,9 @@ func ClearFocus() {
 // HasInputFocus returns true if the currently focused view has a text input
 // element (input, textarea, contenteditable) focused in the DOM.
 // Use this to skip game keybindings while the user is typing in an HTML view.
+//
+// Note: the two atomic loads are not jointly atomic, but this is benign because
+// both values are only modified from Ebiten's single-threaded Update loop.
 func HasInputFocus() bool {
 	ifvid := inputFocusViewID.Load()
 	return ifvid >= 0 && getFocusedViewID() == ifvid
@@ -162,6 +165,9 @@ func New(width, height int, htmlPath string, opts *Options) (*UltralightUI, erro
 }
 
 func newUI(width, height int, html []byte) (*UltralightUI, error) {
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid dimensions: %dx%d", width, height)
+	}
 	// Combined create+load in ONE worker roundtrip, no sleeping
 	viewID := ulCreateViewWithHTML(int32(width), int32(height), string(html))
 	if viewID < 0 {
@@ -181,6 +187,9 @@ func newUI(width, height int, html []byte) (*UltralightUI, error) {
 }
 
 func newUIWithURL(width, height int, url string) (*UltralightUI, error) {
+	if width <= 0 || height <= 0 {
+		return nil, fmt.Errorf("invalid dimensions: %dx%d", width, height)
+	}
 	// Combined create+load in ONE worker roundtrip, no sleeping
 	viewID := ulCreateViewWithURL(int32(width), int32(height), url)
 	if viewID < 0 {
@@ -338,6 +347,11 @@ func (ui *UltralightUI) updateInternal() error {
 		ui.goHelperInjected = true
 	}
 
+	// Re-check closed: an OnMessage callback above may have called Close().
+	if ui.closed {
+		return nil
+	}
+
 	// Hidden view: only drain messages, skip input processing and pixel copying
 	if ui.isHidden() {
 		return nil
@@ -350,8 +364,10 @@ func (ui *UltralightUI) updateInternal() error {
 	// Copy pixels only if Ultralight has rendered changes (dirty bounds).
 	// ul_view_copy_pixels_rgba internally checks if the surface changed;
 	// if no changes, returns 0 without copying (very cheap: just reads a rect).
-	if ulViewCopyPixelsRGBA(ui.viewID, uintptr(unsafe.Pointer(&ui.pixels[0])), int32(len(ui.pixels))) != 0 {
-		ui.texture.WritePixels(ui.pixels)
+	if len(ui.pixels) > 0 && ui.texture != nil {
+		if ulViewCopyPixelsRGBA(ui.viewID, uintptr(unsafe.Pointer(&ui.pixels[0])), int32(len(ui.pixels))) != 0 {
+			ui.texture.WritePixels(ui.pixels)
+		}
 	}
 	return nil
 }
@@ -784,7 +800,11 @@ func ebitenKeyToVK(key ebiten.Key) int32 {
 }
 
 // GetTexture returns the Ebiten image with the current HTML content rendered.
+// Returns nil if the UI has been closed.
 func (ui *UltralightUI) GetTexture() *ebiten.Image {
+	if ui.closed {
+		return nil
+	}
 	return ui.texture
 }
 
@@ -796,19 +816,16 @@ func (ui *UltralightUI) Eval(script string) {
 	evalJS(ui.viewID, script)
 }
 
-// ParseMessage parses msg as JSON if it looks like JSON (starts with '{' or '[').
-// Returns the parsed value, or the raw string if it's not JSON.
+// ParseMessage attempts to parse msg as JSON. If parsing succeeds, the parsed
+// value is returned (map, slice, float64, bool, or nil). If parsing fails,
+// the raw string is returned as-is with no error.
 func ParseMessage(msg string) (interface{}, error) {
 	msg = strings.TrimSpace(msg)
 	if msg == "" {
 		return nil, nil
 	}
-	if (strings.HasPrefix(msg, "{") && strings.HasSuffix(msg, "}")) ||
-		(strings.HasPrefix(msg, "[") && strings.HasSuffix(msg, "]")) {
-		var v interface{}
-		if err := json.Unmarshal([]byte(msg), &v); err != nil {
-			return nil, err
-		}
+	var v interface{}
+	if err := json.Unmarshal([]byte(msg), &v); err == nil {
 		return v, nil
 	}
 	return msg, nil
@@ -818,7 +835,7 @@ func ParseMessage(msg string) (interface{}, error) {
 // window.go.receive(data). Define go.receive in your HTML to handle it.
 func (ui *UltralightUI) Send(data interface{}) error {
 	if ui.closed {
-		return nil
+		return ErrClosed
 	}
 	jsonBytes, err := json.Marshal(data)
 	if err != nil {
@@ -925,4 +942,9 @@ func (ui *UltralightUI) Close() {
 	}
 	ulDestroyView(ui.viewID)
 	unregisterView()
+	if ui.texture != nil {
+		ui.texture.Deallocate()
+		ui.texture = nil
+	}
+	ui.pixels = nil
 }

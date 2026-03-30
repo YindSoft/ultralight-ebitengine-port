@@ -4,16 +4,24 @@
 package ultralightui
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
 )
 
+// ErrClosed is returned when calling methods on a closed UltralightUI.
+var ErrClosed = errors.New("ultralightui: UI is closed")
+
 func init() {
-	// Ultralight requires all API calls to be made from the same OS thread.
+	// Lock the main goroutine to an OS thread. Required because:
+	// 1. Ebiten's RunGame must execute on the main thread (macOS requirement)
+	// 2. purego FFI calls through the bridge need stable thread identity
+	// 3. The C bridge's send_cmd uses thread-local synchronization primitives
 	runtime.LockOSThread()
 }
 
@@ -78,12 +86,11 @@ var (
 )
 
 var (
-	bridgeOnce  sync.Once
-	initErr     error
-	ulInitOnce  sync.Once
-	ulInitErr   error
-	viewCount   int32
-	viewCountMu sync.Mutex
+	bridgeOnce sync.Once
+	initErr    error
+	ulInitOnce sync.Once
+	ulInitErr  error
+	viewCount  atomic.Int32
 )
 
 func initBridge(baseDir string) error {
@@ -108,20 +115,15 @@ func ensureULInit(baseDir string, debug bool) error {
 }
 
 func registerView() {
-	viewCountMu.Lock()
-	viewCount++
-	viewCountMu.Unlock()
+	viewCount.Add(1)
 }
 
 func unregisterView() {
-	viewCountMu.Lock()
-	viewCount--
-	if viewCount < 0 {
-		viewCount = 0
+	if viewCount.Add(-1) < 0 {
+		viewCount.Store(0)
 	}
 	// Don't call ulDestroy() when reaching 0 views: the renderer lives for the
 	// entire application lifetime. ulInit uses sync.Once and cannot be re-initialized.
-	viewCountMu.Unlock()
 }
 
 // resolveAllSymbols registers all exported symbols from the bridge using
@@ -174,8 +176,8 @@ func evalJS(viewID int32, js string) {
 }
 
 func pollMessage(viewID int32) (string, bool) {
-	var buf [8192]byte
-	n := ulViewGetMessage(viewID, uintptr(unsafe.Pointer(&buf[0])), 8192)
+	var buf [65536]byte
+	n := ulViewGetMessage(viewID, uintptr(unsafe.Pointer(&buf[0])), int32(len(buf)))
 	if n <= 0 {
 		return "", false
 	}
@@ -183,8 +185,8 @@ func pollMessage(viewID int32) (string, bool) {
 }
 
 func pollConsoleMessage(viewID int32) (string, bool) {
-	var buf [2048]byte
-	n := ulViewGetConsoleMessage(viewID, uintptr(unsafe.Pointer(&buf[0])), 2048)
+	var buf [8192]byte
+	n := ulViewGetConsoleMessage(viewID, uintptr(unsafe.Pointer(&buf[0])), int32(len(buf)))
 	if n <= 0 {
 		return "", false
 	}

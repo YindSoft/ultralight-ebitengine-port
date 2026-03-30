@@ -34,6 +34,20 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <limits.h>
+
+/* ── Per-view queue lock macros ──────────────────────────────────── */
+#ifdef _WIN32
+  #define VIEW_LOCK(v)         EnterCriticalSection(&(v)->queue_lock)
+  #define VIEW_UNLOCK(v)       LeaveCriticalSection(&(v)->queue_lock)
+  #define VIEW_LOCK_INIT(v)    InitializeCriticalSection(&(v)->queue_lock)
+  #define VIEW_LOCK_DESTROY(v) DeleteCriticalSection(&(v)->queue_lock)
+#else
+  #define VIEW_LOCK(v)         pthread_mutex_lock(&(v)->queue_lock)
+  #define VIEW_UNLOCK(v)       pthread_mutex_unlock(&(v)->queue_lock)
+  #define VIEW_LOCK_INIT(v)    pthread_mutex_init(&(v)->queue_lock, NULL)
+  #define VIEW_LOCK_DESTROY(v) pthread_mutex_destroy(&(v)->queue_lock)
+#endif
 
 /* ── VEH/VCH exception handlers (Windows only, 0x406D1388 = MSVC SetThreadName) ── */
 #ifdef _WIN32
@@ -126,6 +140,12 @@ typedef const char*   (*PFN_ulVersionString)(void);
 typedef void (*PFN_ulEnablePlatformFontLoader)(void);
 typedef void (*PFN_ulEnablePlatformFileSystem)(ULString);
 typedef void (*PFN_ulEnableDefaultLogger)(ULString);
+
+/* ULLogger: custom logger callback (Ultralight 1.4 API) */
+typedef enum { kLogLevel_Error = 0, kLogLevel_Warning = 1, kLogLevel_Info = 2 } ULLogLevel;
+typedef void (*PFN_LoggerLogMessage)(ULLogLevel, ULString);
+typedef struct { PFN_LoggerLogMessage log_message; } ULLogger;
+typedef void (*PFN_ulPlatformSetLogger)(ULLogger);
 
 /* ULBuffer (Ultralight 1.4 opaque buffer) */
 typedef void* ULBuffer;
@@ -234,6 +254,7 @@ static PFN_ulVersionString             pfn_VersionString;
 static PFN_ulEnablePlatformFontLoader  pfn_EnablePlatformFontLoader;
 static PFN_ulEnablePlatformFileSystem  pfn_EnablePlatformFileSystem;
 static PFN_ulEnableDefaultLogger       pfn_EnableDefaultLogger;
+static PFN_ulPlatformSetLogger         pfn_PlatformSetLogger;
 static PFN_ulPlatformSetFileSystem     pfn_PlatformSetFileSystem;
 static PFN_ulCreateBuffer              pfn_CreateBuffer;
 static PFN_ulCreateBufferFromCopy      pfn_CreateBufferFromCopy;
@@ -307,6 +328,12 @@ typedef struct {
     int       bind_count;         /* how many times setup_js_bindings succeeded */
     int       msg_count_total;    /* how many messages received via goSend_dispatch */
     int       rebind_tick;        /* tick counter for spacing out binding retries */
+    /* Per-view mutex: protects queue access from concurrent threads */
+#ifdef _WIN32
+    CRITICAL_SECTION queue_lock;
+#else
+    pthread_mutex_t  queue_lock;
+#endif
 } ViewSlot;
 
 /* ── Circular queue helpers (dynamic) ────────────────────────────────── */
@@ -321,6 +348,7 @@ static bool circ_queue_init(char*** q, int** lens, int* cap) {
 /* Duplica la capacidad de una cola circular, linealizando los elementos. */
 static bool circ_queue_grow(char*** q, int** lens, int* cap, int count, int* tail, int* head) {
     int old_cap = *cap;
+    if (old_cap > INT_MAX / 2) return false; /* overflow guard */
     int new_cap = old_cap * 2;
     char** nq = (char**)malloc(sizeof(char*) * new_cap);
     int* nl = (int*)malloc(sizeof(int) * new_cap);
@@ -347,7 +375,7 @@ static void circ_queue_free(char*** q, int** lens, int* cap, int* head, int* tai
     *cap = *head = *tail = *count = 0;
 }
 
-static ULRenderer g_renderer = NULL;
+static volatile ULRenderer g_renderer = NULL;
 static ViewSlot   g_views[MAX_VIEWS];
 static int        g_view_count = 0;
 
@@ -406,7 +434,7 @@ enum CmdType {
 #endif
 
 static volatile enum CmdType g_cmd_type = CMD_NONE;
-static const char* g_cmd_str_arg = NULL;
+static volatile const char* g_cmd_str_arg = NULL;
 static volatile int g_cmd_int1 = 0;  /* view_id or width */
 static volatile int g_cmd_int2 = 0;  /* height */
 static volatile int g_cmd_result = 0;
@@ -724,6 +752,8 @@ static int resolve_functions(void) {
     RESOLVE(g_hAppCore, pfn_EnablePlatformFontLoader, "ulEnablePlatformFontLoader");
     RESOLVE(g_hAppCore, pfn_EnablePlatformFileSystem, "ulEnablePlatformFileSystem");
     RESOLVE(g_hAppCore, pfn_EnableDefaultLogger, "ulEnableDefaultLogger");
+    /* PlatformSetLogger: opcional, no fatal si no existe */
+    *(void**)&pfn_PlatformSetLogger = GETSYM(g_hUltralight, "ulPlatformSetLogger");
     RESOLVE(g_hUltralight, pfn_PlatformSetFileSystem, "ulPlatformSetFileSystem");
     RESOLVE(g_hUltralight, pfn_CreateBuffer, "ulCreateBuffer");
     RESOLVE(g_hUltralight, pfn_CreateBufferFromCopy, "ulCreateBufferFromCopy");
@@ -922,6 +952,11 @@ static void register_dom_ready(int vid) {
     }
 }
 
+/* Logger silencioso: descarta todos los mensajes de Ultralight */
+static void silent_logger_cb(ULLogLevel level, ULString message) {
+    (void)level; (void)message;
+}
+
 static int worker_do_init(void) {
     if (g_debug) {
         char path[PATHBUF_SIZE];
@@ -929,6 +964,11 @@ static int worker_do_init(void) {
         ULString lp = pfn_CreateString(path);
         pfn_EnableDefaultLogger(lp);
         pfn_DestroyString(lp);
+    } else if (pfn_PlatformSetLogger) {
+        /* Suprimir mensajes de diagnostico de Ultralight (UL-DIAG, etc.) */
+        ULLogger logger;
+        logger.log_message = silent_logger_cb;
+        pfn_PlatformSetLogger(logger);
     }
     pfn_EnablePlatformFontLoader();
     /* Custom VFS: Check VFS first, fall back to disk (g_init_base_dir) */
@@ -1002,6 +1042,7 @@ static int worker_do_create_view(int width, int height) {
     v->bind_count = 0;
     v->msg_count_total = 0;
     v->rebind_tick = 0;
+    VIEW_LOCK_INIT(v);
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
     register_dom_ready(vid);
     pfn_ViewFocus(v->view);
@@ -1020,6 +1061,7 @@ static void worker_do_destroy_view(int vid) {
     if (v->view) { pfn_DestroyView(v->view); v->view = NULL; }
     v->surface = NULL;
     v->used = false;
+    VIEW_LOCK_DESTROY(v);
     v->js_bound = false;
     v->load_phase = 0;
     if (v->pending_load_str) { free(v->pending_load_str); v->pending_load_str = NULL; }
@@ -1083,9 +1125,19 @@ static int worker_do_create_and_load(int width, int height, const char* str, boo
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
     register_dom_ready(vid);
     pfn_ViewFocus(v->view);
+    VIEW_LOCK_INIT(v);
     g_view_count++;
     /* Guardar contenido para carga diferida */
     v->pending_load_str = strdup(str);
+    if (!v->pending_load_str) {
+        blog("worker_do_create_and_load: strdup OOM");
+        pfn_DestroyView(v->view);
+        v->view = NULL;
+        v->used = false;
+        VIEW_LOCK_DESTROY(v);
+        g_view_count--;
+        return -12;
+    }
     v->pending_is_url = is_url;
     v->load_phase = 1; /* priming */
     v->phase_counter = 0;
@@ -1124,6 +1176,7 @@ static int worker_do_create_with_content(int width, int height, const char* cont
     v->load_phase = 0;
     v->phase_counter = 0;
     v->pending_load_str = NULL;
+    VIEW_LOCK_INIT(v);
     pfn_ViewSetConsoleCallback(v->view, console_message_cb, (void*)(intptr_t)vid);
     register_dom_ready(vid);
     pfn_ViewFocus(v->view);
@@ -1177,17 +1230,34 @@ static void worker_do_tick(void) {
     for (int vid = 0; vid < MAX_VIEWS; vid++) {
         ViewSlot* v = &g_views[vid];
         if (!v->used || !v->view) continue;
+
+        /* Snapshot queues under lock, then process without holding it */
+        MouseQueueEntry  local_mouse[MOUSE_QUEUE_MAX];
+        ScrollQueueEntry local_scroll[SCROLL_QUEUE_MAX];
+        int local_mouse_count, local_scroll_count;
+
+        VIEW_LOCK(v);
+        local_mouse_count = v->mouse_count;
+        if (local_mouse_count > 0)
+            memcpy(local_mouse, v->mouse_queue, sizeof(MouseQueueEntry) * local_mouse_count);
+        v->mouse_count = 0;
+        local_scroll_count = v->scroll_count;
+        if (local_scroll_count > 0)
+            memcpy(local_scroll, v->scroll_queue, sizeof(ScrollQueueEntry) * local_scroll_count);
+        v->scroll_count = 0;
+        VIEW_UNLOCK(v);
+
         /* Mouse coalescing: only send the last MOVED, but keep all DOWN/UP events.
            When the cursor moves fast, many redundant MOVED events accumulate;
            only the final position matters for hover/CSS. */
         {
             int last_moved = -1;
-            for (int i = 0; i < v->mouse_count; i++) {
-                if (v->mouse_queue[i].type == 0) /* MOVED */
+            for (int i = 0; i < local_mouse_count; i++) {
+                if (local_mouse[i].type == 0) /* MOVED */
                     last_moved = i;
             }
-            for (int i = 0; i < v->mouse_count; i++) {
-                MouseQueueEntry* e = &v->mouse_queue[i];
+            for (int i = 0; i < local_mouse_count; i++) {
+                MouseQueueEntry* e = &local_mouse[i];
                 if (e->type == 0 && i != last_moved)
                     continue; /* skip intermediate MOVED events */
                 int x = e->x, y = e->y;
@@ -1204,26 +1274,49 @@ static void worker_do_tick(void) {
                 pfn_DestroyMouseEvent(evt);
             }
         }
-        v->mouse_count = 0;
-        for (int i = 0; i < v->scroll_count; i++) {
-            ScrollQueueEntry* e = &v->scroll_queue[i];
+        for (int i = 0; i < local_scroll_count; i++) {
+            ScrollQueueEntry* e = &local_scroll[i];
             ULScrollEvent evt = pfn_CreateScrollEvent(e->type, e->dx, e->dy);
             pfn_ViewFireScrollEvent(v->view, evt);
             pfn_DestroyScrollEvent(evt);
         }
-        v->scroll_count = 0;
+        /* Snapshot key and JS queues under lock */
+        KeyQueueEntry local_keys[KEY_QUEUE_MAX];
+        int local_key_count;
+        char** local_js = NULL;
+        int local_js_count = 0;
+
+        VIEW_LOCK(v);
+        local_key_count = v->key_count;
+        if (local_key_count > 0)
+            memcpy(local_keys, v->key_queue, sizeof(KeyQueueEntry) * local_key_count);
+        v->key_count = 0;
+        if (v->js_queue && v->js_count > 0) {
+            local_js_count = v->js_count;
+            local_js = (char**)malloc(sizeof(char*) * local_js_count);
+            if (local_js) {
+                memcpy(local_js, v->js_queue, sizeof(char*) * local_js_count);
+                /* Clear originals so they won't be double-freed */
+                memset(v->js_queue, 0, sizeof(char*) * local_js_count);
+            } else {
+                local_js_count = 0;
+            }
+        }
+        v->js_count = 0;
+        VIEW_UNLOCK(v);
+
 #ifdef _WIN32
         /* Guardar keyboard state una sola vez antes del loop para evitar
            Get/SetKeyboardState + memcpy por cada tecla (~8KB de copias eliminadas) */
         BYTE saved_ks[256];
         bool ks_saved = false;
-        if (v->key_count > 0 && pfn_CreateKeyEventWin) {
+        if (local_key_count > 0 && pfn_CreateKeyEventWin) {
             GetKeyboardState(saved_ks);
             ks_saved = true;
         }
 #endif
-        for (int i = 0; i < v->key_count; i++) {
-            KeyQueueEntry* e = &v->key_queue[i];
+        for (int i = 0; i < local_key_count; i++) {
+            KeyQueueEntry* e = &local_keys[i];
             /* Map type (0=RawKeyDown,1=KeyDown,2=KeyUp,3=Char) to SDK enum (0=KeyDown,1=KeyUp,2=RawKeyDown,3=Char) */
             unsigned int ul_type = (unsigned int)(e->type == 0 ? 2 : e->type == 1 ? 0 : e->type == 2 ? 1 : 3);
 #ifdef _WIN32
@@ -1261,20 +1354,17 @@ static void worker_do_tick(void) {
             SetKeyboardState(saved_ks);
         }
 #endif
-        v->key_count = 0;
-        if (v->js_queue) {
-            /* Use ulViewEvaluateScript(view, ...) which targets the correct view
-             * via its ULView handle. Do NOT use JSEvaluateScript with locked context
-             * because pfn_ViewLockJSContext returns incorrect context pointers on macOS. */
-            for (int i = 0; i < v->js_count; i++) {
-                ULString s = pfn_CreateString(v->js_queue[i]);
+        /* Process JS eval queue (already snapshotted above) */
+        if (local_js) {
+            for (int i = 0; i < local_js_count; i++) {
+                if (!local_js[i]) continue;
+                ULString s = pfn_CreateString(local_js[i]);
                 pfn_ViewEvaluateScript(v->view, s, NULL);
                 pfn_DestroyString(s);
-                free(v->js_queue[i]);
-                v->js_queue[i] = NULL;
+                free(local_js[i]);
             }
+            free(local_js);
         }
-        v->js_count = 0;
     }
     /* Safety: re-try JS bindings ONLY for views that haven't received
      * any messages yet. Once a message arrives (or DOMReady fires and
@@ -1313,6 +1403,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
     while (1) {
         WaitForSingleObject(g_cmd_event, INFINITE);
         enum CmdType cmd = g_cmd_type;
+        const char* str_arg = (const char*)g_cmd_str_arg; /* safe: main thread blocked */
         g_cmd_type = CMD_NONE;
         switch (cmd) {
         case CMD_INIT:
@@ -1325,19 +1416,19 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
             worker_do_destroy_view(g_cmd_int1);
             break;
         case CMD_LOAD_HTML:
-            worker_do_load(g_cmd_int1, g_cmd_str_arg, false);
+            worker_do_load(g_cmd_int1, str_arg, false);
             break;
         case CMD_LOAD_URL:
-            worker_do_load(g_cmd_int1, g_cmd_str_arg, true);
+            worker_do_load(g_cmd_int1, str_arg, true);
             break;
         case CMD_CREATE_AND_LOAD:
-            g_cmd_result = worker_do_create_and_load(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            g_cmd_result = worker_do_create_and_load(g_cmd_int1, g_cmd_int2, str_arg, true);
             break;
         case CMD_CREATE_WITH_HTML:
-            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, false);
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, str_arg, false);
             break;
         case CMD_CREATE_WITH_URL:
-            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, str_arg, true);
             break;
         case CMD_TICK:
             worker_do_tick();
@@ -1345,7 +1436,7 @@ static DWORD WINAPI worker_thread_proc(LPVOID param) {
         case CMD_QUIT:
             for (int i = 0; i < MAX_VIEWS; i++)
                 worker_do_destroy_view(i);
-            if (g_renderer) { pfn_DestroyRenderer(g_renderer); g_renderer = NULL; }
+            if (g_renderer) { pfn_DestroyRenderer((ULRenderer)g_renderer); g_renderer = NULL; }
             SetEvent(g_done_event);
             return 0;
         default:
@@ -1380,6 +1471,7 @@ static void* worker_thread_proc(void* param) {
             pthread_cond_wait(&g_cmd_cond, &g_cmd_mutex);
         g_cmd_ready = 0;
         enum CmdType cmd = g_cmd_type;
+        const char* str_arg = (const char*)g_cmd_str_arg; /* safe: main thread blocked */
         g_cmd_type = CMD_NONE;
         pthread_mutex_unlock(&g_cmd_mutex);
 
@@ -1394,19 +1486,19 @@ static void* worker_thread_proc(void* param) {
             worker_do_destroy_view(g_cmd_int1);
             break;
         case CMD_LOAD_HTML:
-            worker_do_load(g_cmd_int1, g_cmd_str_arg, false);
+            worker_do_load(g_cmd_int1, str_arg, false);
             break;
         case CMD_LOAD_URL:
-            worker_do_load(g_cmd_int1, g_cmd_str_arg, true);
+            worker_do_load(g_cmd_int1, str_arg, true);
             break;
         case CMD_CREATE_AND_LOAD:
-            g_cmd_result = worker_do_create_and_load(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            g_cmd_result = worker_do_create_and_load(g_cmd_int1, g_cmd_int2, str_arg, true);
             break;
         case CMD_CREATE_WITH_HTML:
-            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, false);
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, str_arg, false);
             break;
         case CMD_CREATE_WITH_URL:
-            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, g_cmd_str_arg, true);
+            g_cmd_result = worker_do_create_with_content(g_cmd_int1, g_cmd_int2, str_arg, true);
             break;
         case CMD_TICK:
             worker_do_tick();
@@ -1414,7 +1506,7 @@ static void* worker_thread_proc(void* param) {
         case CMD_QUIT:
             for (int i = 0; i < MAX_VIEWS; i++)
                 worker_do_destroy_view(i);
-            if (g_renderer) { pfn_DestroyRenderer(g_renderer); g_renderer = NULL; }
+            if (g_renderer) { pfn_DestroyRenderer((ULRenderer)g_renderer); g_renderer = NULL; }
             pthread_mutex_lock(&g_cmd_mutex);
             g_cmd_done = 1;
             pthread_cond_signal(&g_done_cond);
@@ -1658,6 +1750,11 @@ EXPORT int ul_view_copy_pixels_rgba(int view_id, unsigned char* dest, int dest_s
     int w = v->width;
     int h = v->height;
     unsigned int rowBytes = pfn_SurfaceGetRowBytes(v->surface);
+    if (w <= 0 || h <= 0 || w > INT_MAX / 4 / h) {
+        /* Overflow guard: w*h*4 would exceed INT_MAX */
+        pfn_SurfaceUnlockPixels(v->surface);
+        return 0;
+    }
     int needed = w * h * 4;
     if (dest_size < needed) {
         pfn_SurfaceUnlockPixels(v->surface);
@@ -1696,59 +1793,72 @@ EXPORT int ul_view_get_surface_height(int view_id) {
 EXPORT void ul_view_fire_mouse(int view_id, int type, int x, int y, int button) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return;
     ViewSlot* v = &g_views[view_id];
-    if (v->mouse_count >= MOUSE_QUEUE_MAX) return;
-    MouseQueueEntry* e = &v->mouse_queue[v->mouse_count++];
-    e->type = type; e->x = x; e->y = y; e->button = button;
+    VIEW_LOCK(v);
+    if (v->mouse_count < MOUSE_QUEUE_MAX) {
+        MouseQueueEntry* e = &v->mouse_queue[v->mouse_count++];
+        e->type = type; e->x = x; e->y = y; e->button = button;
+    }
+    VIEW_UNLOCK(v);
 }
 
 EXPORT void ul_view_fire_scroll(int view_id, int type, int dx, int dy) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return;
     ViewSlot* v = &g_views[view_id];
-    if (v->scroll_count >= SCROLL_QUEUE_MAX) return;
-    ScrollQueueEntry* e = &v->scroll_queue[v->scroll_count++];
-    e->type = type; e->dx = dx; e->dy = dy;
+    VIEW_LOCK(v);
+    if (v->scroll_count < SCROLL_QUEUE_MAX) {
+        ScrollQueueEntry* e = &v->scroll_queue[v->scroll_count++];
+        e->type = type; e->dx = dx; e->dy = dy;
+    }
+    VIEW_UNLOCK(v);
 }
 
 EXPORT void ul_view_fire_key(int view_id, int type, int vk, unsigned int mods, const char* text) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return;
     ViewSlot* v = &g_views[view_id];
-    if (v->key_count >= KEY_QUEUE_MAX) return;
-    KeyQueueEntry* e = &v->key_queue[v->key_count++];
-    e->type = type; e->vk = vk; e->mods = mods;
-    if (text) {
-        size_t n = strlen(text);
-        if (n >= KEY_TEXT_LEN) n = KEY_TEXT_LEN - 1;
-        memcpy(e->text, text, n + 1);
-    } else
-        e->text[0] = '\0';
+    VIEW_LOCK(v);
+    if (v->key_count < KEY_QUEUE_MAX) {
+        KeyQueueEntry* e = &v->key_queue[v->key_count++];
+        e->type = type; e->vk = vk; e->mods = mods;
+        if (text) {
+            size_t n = strlen(text);
+            if (n >= KEY_TEXT_LEN) n = KEY_TEXT_LEN - 1;
+            memcpy(e->text, text, n + 1);
+        } else
+            e->text[0] = '\0';
+    }
+    VIEW_UNLOCK(v);
 }
 
 EXPORT void ul_view_eval_js(int view_id, const char* js) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !js) return;
     ViewSlot* v = &g_views[view_id];
+    VIEW_LOCK(v);
     /* Inicializar cola si es necesario */
     if (!v->js_queue) {
         v->js_capacity = JS_QUEUE_INITIAL;
         v->js_queue = (char**)malloc(sizeof(char*) * v->js_capacity);
-        if (!v->js_queue) return;
+        if (!v->js_queue) { VIEW_UNLOCK(v); return; }
     }
     /* Expandir cola si esta llena (duplicar capacidad) */
     if (v->js_count >= v->js_capacity) {
+        if (v->js_capacity > INT_MAX / 2) { VIEW_UNLOCK(v); return; } /* overflow guard */
         int new_cap = v->js_capacity * 2;
         char** new_q = (char**)realloc(v->js_queue, sizeof(char*) * new_cap);
-        if (!new_q) return;
+        if (!new_q) { VIEW_UNLOCK(v); return; }
         v->js_queue = new_q;
         v->js_capacity = new_cap;
     }
     v->js_queue[v->js_count] = strdup(js);
-    if (!v->js_queue[v->js_count]) return;
+    if (!v->js_queue[v->js_count]) { VIEW_UNLOCK(v); return; }
     v->js_count++;
+    VIEW_UNLOCK(v);
 }
 
 EXPORT int ul_view_get_message(int view_id, char* buf, int buf_size) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !buf || buf_size <= 0) return 0;
     ViewSlot* v = &g_views[view_id];
-    if (v->msg_count <= 0) return 0;
+    VIEW_LOCK(v);
+    if (v->msg_count <= 0) { VIEW_UNLOCK(v); return 0; }
     int len = v->msg_lens[v->msg_tail];
     int cl = len < (buf_size - 1) ? len : (buf_size - 1);
     memcpy(buf, v->msg_queue[v->msg_tail], cl);
@@ -1757,13 +1867,15 @@ EXPORT int ul_view_get_message(int view_id, char* buf, int buf_size) {
     v->msg_queue[v->msg_tail] = NULL;
     v->msg_tail = (v->msg_tail + 1) % v->msg_capacity;
     v->msg_count--;
+    VIEW_UNLOCK(v);
     return cl;
 }
 
 EXPORT int ul_view_get_console_message(int view_id, char* buf, int buf_size) {
     if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used || !buf || buf_size <= 0) return 0;
     ViewSlot* v = &g_views[view_id];
-    if (v->console_count <= 0) return 0;
+    VIEW_LOCK(v);
+    if (v->console_count <= 0) { VIEW_UNLOCK(v); return 0; }
     int len = v->console_lens[v->console_tail];
     int cl = len < (buf_size - 1) ? len : (buf_size - 1);
     memcpy(buf, v->console_msgs[v->console_tail], cl);
@@ -1772,6 +1884,7 @@ EXPORT int ul_view_get_console_message(int view_id, char* buf, int buf_size) {
     v->console_msgs[v->console_tail] = NULL;
     v->console_tail = (v->console_tail + 1) % v->console_capacity;
     v->console_count--;
+    VIEW_UNLOCK(v);
     return cl;
 }
 
