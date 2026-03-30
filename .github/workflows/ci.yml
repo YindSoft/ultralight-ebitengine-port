@@ -32,4 +32,9 @@ jobs:
         run: go build ./...
 
       - name: Test
+        if: runner.os == 'Windows' || runner.os == 'macOS'
         run: go test -short -v ./...
+
+      - name: Test (Linux headless)
+        if: runner.os == 'Linux'
+        run: xvfb-run go test -short -v ./...
