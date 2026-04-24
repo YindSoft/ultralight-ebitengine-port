@@ -204,6 +204,24 @@ typedef JSStringRef  (*PFN_JSValueToStringCopy)(JSContextRef, JSValueRef, JSValu
  * which on macOS may target the wrong view's context). */
 typedef JSValueRef   (*PFN_JSEvaluateScript)(JSContextRef, JSStringRef, JSObjectRef, JSStringRef, int, JSValueRef*);
 
+/* JSC API extra para zero-copy binary send (ul_view_send_binary):
+ * permite parsear el JSON de props, crear un Uint8Array desde bytes nativos,
+ * setearlo como propiedad y llamar window.go.receive sin pasar por
+ * ulViewEvaluateScript (que parsearia el binario como string base64). */
+typedef JSValueRef   (*PFN_JSValueMakeFromJSONString)(JSContextRef, JSStringRef);
+typedef JSObjectRef  (*PFN_JSValueToObject)(JSContextRef, JSValueRef, JSValueRef*);
+typedef JSObjectRef  (*PFN_JSObjectMakeTypedArray)(JSContextRef, int /*JSTypedArrayType*/, size_t, JSValueRef*);
+typedef void*        (*PFN_JSObjectGetTypedArrayBytesPtr)(JSContextRef, JSObjectRef, JSValueRef*);
+typedef size_t       (*PFN_JSObjectGetTypedArrayByteLength)(JSContextRef, JSObjectRef, JSValueRef*);
+typedef JSValueRef   (*PFN_JSObjectGetProperty)(JSContextRef, JSObjectRef, JSStringRef, JSValueRef*);
+typedef JSValueRef   (*PFN_JSObjectCallAsFunction)(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+typedef bool         (*PFN_JSValueIsObject)(JSContextRef, JSValueRef);
+/* JSTypedArrayType enum (de JSTypedArray.h):
+ *   kJSTypedArrayTypeNone=0, Int8Array=1, Int16Array=2, Int32Array=3,
+ *   Uint8Array=4, Uint8ClampedArray=5, Uint16Array=6, Uint32Array=7,
+ *   Float32Array=8, Float64Array=9, ArrayBuffer=10. */
+#define JSC_TYPED_ARRAY_UINT8 4
+
 static PFN_ulCreateString              pfn_CreateString;
 static PFN_ulDestroyString             pfn_DestroyString;
 static PFN_ulStringGetData             pfn_StringGetData;
@@ -273,6 +291,14 @@ static PFN_JSObjectSetProperty                 pfn_JSObjectSetProperty;
 static PFN_JSValueIsString                     pfn_JSValueIsString;
 static PFN_JSValueToStringCopy                 pfn_JSValueToStringCopy;
 static PFN_JSEvaluateScript                    pfn_JSEvaluateScript;
+static PFN_JSValueMakeFromJSONString           pfn_JSValueMakeFromJSONString;
+static PFN_JSValueToObject                     pfn_JSValueToObject;
+static PFN_JSObjectMakeTypedArray              pfn_JSObjectMakeTypedArray;
+static PFN_JSObjectGetTypedArrayBytesPtr       pfn_JSObjectGetTypedArrayBytesPtr;
+static PFN_JSObjectGetTypedArrayByteLength     pfn_JSObjectGetTypedArrayByteLength;
+static PFN_JSObjectGetProperty                 pfn_JSObjectGetProperty;
+static PFN_JSObjectCallAsFunction              pfn_JSObjectCallAsFunction;
+static PFN_JSValueIsObject                     pfn_JSValueIsObject;
 
 /* ── Queue and view constants ────────────────────────────────────── */
 #define MAX_VIEWS 16
@@ -286,6 +312,10 @@ static PFN_JSEvaluateScript                    pfn_JSEvaluateScript;
 typedef struct { int type, x, y, button; } MouseQueueEntry;
 typedef struct { int type, dx, dy; } ScrollQueueEntry;
 typedef struct { int type; int vk; unsigned int mods; char text[KEY_TEXT_LEN]; } KeyQueueEntry;
+/* BinaryQueueEntry: zero-copy send. props_json/bin_key son strdup'd, bin_data
+ * es malloc'd (transferido por ul_view_send_binary). El procesador en ul_tick
+ * libera todos. */
+typedef struct { char* props_json; char* bin_key; void* bin_data; size_t bin_len; } BinaryQueueEntry;
 
 typedef struct {
     ULView    view;
@@ -308,6 +338,11 @@ typedef struct {
     char**    js_queue;
     int       js_count;
     int       js_capacity;
+    /* Binary message queue: zero-copy path para overlay frames. Cada entry tiene
+     * props_json + bin_key + bin_data. Procesado en ul_tick despues de js_queue. */
+    BinaryQueueEntry* binary_queue;
+    int       binary_count;
+    int       binary_capacity;
     /* Native message queue (JS -> Go via __goSend, not console) */
     char**    msg_queue;
     int*      msg_lens;
@@ -778,6 +813,16 @@ static int resolve_functions(void) {
     /* Opcional: JSEvaluateScript permite evaluar JS en un contexto locked especifico,
      * evitando que ulViewEvaluateScript apunte al view incorrecto en macOS. */
     *(void**)&pfn_JSEvaluateScript = GETSYM(g_hWebCore, "JSEvaluateScript");
+    /* JSC API extra para zero-copy binary send. Todas opcionales: si faltan, el
+     * caller hace fallback a base64 + ul_view_eval_js. */
+    *(void**)&pfn_JSValueMakeFromJSONString       = GETSYM(g_hWebCore, "JSValueMakeFromJSONString");
+    *(void**)&pfn_JSValueToObject                 = GETSYM(g_hWebCore, "JSValueToObject");
+    *(void**)&pfn_JSObjectMakeTypedArray          = GETSYM(g_hWebCore, "JSObjectMakeTypedArray");
+    *(void**)&pfn_JSObjectGetTypedArrayBytesPtr   = GETSYM(g_hWebCore, "JSObjectGetTypedArrayBytesPtr");
+    *(void**)&pfn_JSObjectGetTypedArrayByteLength = GETSYM(g_hWebCore, "JSObjectGetTypedArrayByteLength");
+    *(void**)&pfn_JSObjectGetProperty             = GETSYM(g_hWebCore, "JSObjectGetProperty");
+    *(void**)&pfn_JSObjectCallAsFunction          = GETSYM(g_hWebCore, "JSObjectCallAsFunction");
+    *(void**)&pfn_JSValueIsObject                 = GETSYM(g_hWebCore, "JSValueIsObject");
     blog("JSContextGetGlobalContext: %s", pfn_JSContextGetGlobalContext ? "found" : "NOT found");
     blog("JSEvaluateScript: %s", pfn_JSEvaluateScript ? "found" : "NOT found (fallback to ulViewEvaluateScript)");
     blog("DOMReadyCallback: %s", pfn_ViewSetDOMReadyCallback ? "found" : "NOT found");
@@ -1039,6 +1084,9 @@ static int worker_do_create_view(int width, int height) {
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->binary_queue = NULL;
+    v->binary_count = 0;
+    v->binary_capacity = 0;
     v->bind_count = 0;
     v->msg_count_total = 0;
     v->rebind_tick = 0;
@@ -1071,6 +1119,15 @@ static void worker_do_destroy_view(int vid) {
         free(v->js_queue); v->js_queue = NULL;
     }
     v->js_count = 0; v->js_capacity = 0;
+    if (v->binary_queue) {
+        for (int i = 0; i < v->binary_count; i++) {
+            free(v->binary_queue[i].props_json);
+            free(v->binary_queue[i].bin_key);
+            free(v->binary_queue[i].bin_data);
+        }
+        free(v->binary_queue); v->binary_queue = NULL;
+    }
+    v->binary_count = 0; v->binary_capacity = 0;
     circ_queue_free(&v->msg_queue, &v->msg_lens, &v->msg_capacity,
                     &v->msg_head, &v->msg_tail, &v->msg_count);
     circ_queue_free(&v->console_msgs, &v->console_lens, &v->console_capacity,
@@ -1119,6 +1176,9 @@ static int worker_do_create_and_load(int width, int height, const char* str, boo
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->binary_queue = NULL;
+    v->binary_count = 0;
+    v->binary_capacity = 0;
     v->bind_count = 0;
     v->msg_count_total = 0;
     v->rebind_tick = 0;
@@ -1170,6 +1230,9 @@ static int worker_do_create_with_content(int width, int height, const char* cont
     v->console_head = v->console_tail = v->console_count = 0;
     v->msg_head = v->msg_tail = v->msg_count = 0;
     v->mouse_count = v->scroll_count = v->key_count = v->js_count = 0;
+    v->binary_queue = NULL;
+    v->binary_count = 0;
+    v->binary_capacity = 0;
     v->bind_count = 0;
     v->msg_count_total = 0;
     v->rebind_tick = 0;
@@ -1280,11 +1343,13 @@ static void worker_do_tick(void) {
             pfn_ViewFireScrollEvent(v->view, evt);
             pfn_DestroyScrollEvent(evt);
         }
-        /* Snapshot key and JS queues under lock */
+        /* Snapshot key, JS y binary queues under lock */
         KeyQueueEntry local_keys[KEY_QUEUE_MAX];
         int local_key_count;
         char** local_js = NULL;
         int local_js_count = 0;
+        BinaryQueueEntry* local_binary = NULL;
+        int local_binary_count = 0;
 
         VIEW_LOCK(v);
         local_key_count = v->key_count;
@@ -1303,6 +1368,18 @@ static void worker_do_tick(void) {
             }
         }
         v->js_count = 0;
+        if (v->binary_queue && v->binary_count > 0) {
+            local_binary_count = v->binary_count;
+            local_binary = (BinaryQueueEntry*)malloc(sizeof(BinaryQueueEntry) * local_binary_count);
+            if (local_binary) {
+                memcpy(local_binary, v->binary_queue, sizeof(BinaryQueueEntry) * local_binary_count);
+                /* Clear originals (transfer ownership a local) */
+                memset(v->binary_queue, 0, sizeof(BinaryQueueEntry) * local_binary_count);
+            } else {
+                local_binary_count = 0;
+            }
+        }
+        v->binary_count = 0;
         VIEW_UNLOCK(v);
 
 #ifdef _WIN32
@@ -1364,6 +1441,108 @@ static void worker_do_tick(void) {
                 free(local_js[i]);
             }
             free(local_js);
+        }
+
+        /* Process binary queue (zero-copy send a window.go.receive). Para cada
+         * entry:
+         *   1. Lock JSC ctx, parse props_json a JS object via JSValueMakeFromJSONString.
+         *   2. Crear Uint8Array y memcpy bin_data adentro.
+         *   3. Setear el array como propiedad bin_key del object.
+         *   4. Get window.go.receive y llamarlo con el object.
+         *
+         * Si algun simbolo JSC no fue resuelto, hacemos fallback a un ulViewEvaluateScript
+         * con base64 (caller no espera fallback automatico, el path esta documentado
+         * como "best effort"; el caller deberia chequear las capabilities con
+         * ul_supports_binary_send antes de usar). */
+        if (local_binary) {
+            /* Capabilities check: simbolos minimos requeridos. JSValueIsObject es
+             * opcional (no lo usamos — pasamos directo por JSValueToObject). */
+            bool can_binary =
+                pfn_ViewLockJSContext && pfn_ViewUnlockJSContext &&
+                pfn_JSContextGetGlobalObject && pfn_JSStringCreateWithUTF8CString &&
+                pfn_JSStringRelease && pfn_JSValueMakeFromJSONString &&
+                pfn_JSValueToObject && pfn_JSObjectMakeTypedArray &&
+                pfn_JSObjectGetTypedArrayBytesPtr && pfn_JSObjectSetProperty &&
+                pfn_JSObjectGetProperty && pfn_JSObjectCallAsFunction;
+            if (can_binary) {
+                JSContextRef rawCtx = pfn_ViewLockJSContext(v->view);
+                if (rawCtx) {
+                    JSContextRef ctx = rawCtx;
+                    if (pfn_JSContextGetGlobalContext) ctx = pfn_JSContextGetGlobalContext(rawCtx);
+                    JSObjectRef global = pfn_JSContextGetGlobalObject(ctx);
+
+                    /* Resolver window.go.receive una sola vez por batch.
+                     * Sin JSValueIsObject (opcional): pasamos directo por JSValueToObject,
+                     * que retorna NULL si goVal no es un object. */
+                    JSStringRef sGo = pfn_JSStringCreateWithUTF8CString("go");
+                    JSValueRef goVal = pfn_JSObjectGetProperty(ctx, global, sGo, NULL);
+                    pfn_JSStringRelease(sGo);
+                    JSObjectRef goObj = goVal ? pfn_JSValueToObject(ctx, goVal, NULL) : NULL;
+                    JSObjectRef receiveFn = NULL;
+                    if (goObj) {
+                        JSStringRef sRecv = pfn_JSStringCreateWithUTF8CString("receive");
+                        JSValueRef recvVal = pfn_JSObjectGetProperty(ctx, goObj, sRecv, NULL);
+                        pfn_JSStringRelease(sRecv);
+                        if (recvVal) receiveFn = pfn_JSValueToObject(ctx, recvVal, NULL);
+                    }
+
+                    for (int i = 0; i < local_binary_count; i++) {
+                        BinaryQueueEntry* be = &local_binary[i];
+                        if (!be->props_json || !be->bin_key || !be->bin_data || be->bin_len == 0 || !receiveFn) {
+                            free(be->props_json); free(be->bin_key); free(be->bin_data);
+                            continue;
+                        }
+
+                        /* Parse props JSON a object. */
+                        JSStringRef sJson = pfn_JSStringCreateWithUTF8CString(be->props_json);
+                        JSValueRef parsed = pfn_JSValueMakeFromJSONString(ctx, sJson);
+                        pfn_JSStringRelease(sJson);
+                        if (!parsed) {
+                            free(be->props_json); free(be->bin_key); free(be->bin_data);
+                            continue;
+                        }
+                        JSObjectRef propsObj = pfn_JSValueToObject(ctx, parsed, NULL);
+                        if (!propsObj) {
+                            free(be->props_json); free(be->bin_key); free(be->bin_data);
+                            continue;
+                        }
+
+                        /* Crear Uint8Array y memcpy. JSObjectMakeTypedArray asigna el
+                         * buffer interno; obtenemos puntero y copiamos los bytes Go. */
+                        JSObjectRef u8 = pfn_JSObjectMakeTypedArray(ctx, JSC_TYPED_ARRAY_UINT8, be->bin_len, NULL);
+                        if (u8) {
+                            void* dst = pfn_JSObjectGetTypedArrayBytesPtr(ctx, u8, NULL);
+                            if (dst) {
+                                memcpy(dst, be->bin_data, be->bin_len);
+                                JSStringRef sKey = pfn_JSStringCreateWithUTF8CString(be->bin_key);
+                                pfn_JSObjectSetProperty(ctx, propsObj, sKey, u8, 0, NULL);
+                                pfn_JSStringRelease(sKey);
+
+                                JSValueRef args[1] = { propsObj };
+                                pfn_JSObjectCallAsFunction(ctx, receiveFn, NULL, 1, args, NULL);
+                            }
+                        }
+
+                        free(be->props_json); free(be->bin_key); free(be->bin_data);
+                    }
+                    pfn_ViewUnlockJSContext(v->view);
+                } else {
+                    /* No ctx: liberar sin enviar */
+                    for (int i = 0; i < local_binary_count; i++) {
+                        free(local_binary[i].props_json);
+                        free(local_binary[i].bin_key);
+                        free(local_binary[i].bin_data);
+                    }
+                }
+            } else {
+                /* JSC API insuficiente: liberar (caller hace fallback automatico) */
+                for (int i = 0; i < local_binary_count; i++) {
+                    free(local_binary[i].props_json);
+                    free(local_binary[i].bin_key);
+                    free(local_binary[i].bin_data);
+                }
+            }
+            free(local_binary);
         }
     }
     /* Safety: re-try JS bindings ONLY for views that haven't received
@@ -1826,6 +2005,61 @@ EXPORT void ul_view_fire_key(int view_id, int type, int vk, unsigned int mods, c
         } else
             e->text[0] = '\0';
     }
+    VIEW_UNLOCK(v);
+}
+
+/* ul_supports_binary_send: retorna 1 si todos los simbolos JSC necesarios
+ * estan resueltos para el path zero-copy binario. Si retorna 0, el caller
+ * debe usar ul_view_eval_js con base64 como fallback. */
+EXPORT int ul_supports_binary_send(void) {
+    return (pfn_ViewLockJSContext && pfn_ViewUnlockJSContext &&
+            pfn_JSContextGetGlobalObject && pfn_JSStringCreateWithUTF8CString &&
+            pfn_JSStringRelease && pfn_JSValueMakeFromJSONString &&
+            pfn_JSValueToObject && pfn_JSObjectMakeTypedArray &&
+            pfn_JSObjectGetTypedArrayBytesPtr && pfn_JSObjectSetProperty &&
+            pfn_JSObjectGetProperty && pfn_JSObjectCallAsFunction) ? 1 : 0;
+}
+
+/* ul_view_send_binary: encola un mensaje binario zero-copy. Va a window.go.receive
+ * con un objeto JS construido desde props_json, agregando una propiedad bin_key
+ * con un Uint8Array de los bytes copiados de bin_data.
+ *
+ * Ownership: copiamos props_json, bin_key y bin_data internamente (strdup +
+ * malloc+memcpy). El caller puede liberar/reusar sus buffers despues de la
+ * llamada. El procesamiento real ocurre en ul_tick (worker thread con JSC ctx). */
+EXPORT void ul_view_send_binary(int view_id, const char* props_json, const char* bin_key,
+                                const void* bin_data, int bin_len) {
+    if (view_id < 0 || view_id >= MAX_VIEWS || !g_views[view_id].used) return;
+    if (!props_json || !bin_key || !bin_data || bin_len <= 0) return;
+    ViewSlot* v = &g_views[view_id];
+    VIEW_LOCK(v);
+    if (!v->binary_queue) {
+        v->binary_capacity = JS_QUEUE_INITIAL;
+        v->binary_queue = (BinaryQueueEntry*)calloc(v->binary_capacity, sizeof(BinaryQueueEntry));
+        if (!v->binary_queue) { VIEW_UNLOCK(v); return; }
+    }
+    if (v->binary_count >= v->binary_capacity) {
+        if (v->binary_capacity > INT_MAX / 2) { VIEW_UNLOCK(v); return; }
+        int new_cap = v->binary_capacity * 2;
+        BinaryQueueEntry* new_q = (BinaryQueueEntry*)realloc(v->binary_queue, sizeof(BinaryQueueEntry) * new_cap);
+        if (!new_q) { VIEW_UNLOCK(v); return; }
+        memset(new_q + v->binary_capacity, 0, sizeof(BinaryQueueEntry) * (new_cap - v->binary_capacity));
+        v->binary_queue = new_q;
+        v->binary_capacity = new_cap;
+    }
+    BinaryQueueEntry* be = &v->binary_queue[v->binary_count];
+    be->props_json = strdup(props_json);
+    be->bin_key = strdup(bin_key);
+    be->bin_data = malloc((size_t)bin_len);
+    be->bin_len = (size_t)bin_len;
+    if (!be->props_json || !be->bin_key || !be->bin_data) {
+        free(be->props_json); free(be->bin_key); free(be->bin_data);
+        memset(be, 0, sizeof(BinaryQueueEntry));
+        VIEW_UNLOCK(v);
+        return;
+    }
+    memcpy(be->bin_data, bin_data, (size_t)bin_len);
+    v->binary_count++;
     VIEW_UNLOCK(v);
 }
 

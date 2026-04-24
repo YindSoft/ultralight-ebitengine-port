@@ -83,6 +83,8 @@ var (
 	ulCreateViewWithURL     func(width, height int32, url string) int32
 	ulViewGetSurfaceWidth   func(viewID int32) int32
 	ulViewGetSurfaceHeight  func(viewID int32) int32
+	ulSupportsBinarySend    func() int32
+	ulViewSendBinary        func(viewID int32, propsJSON, binKey string, binData uintptr, binLen int32)
 )
 
 var (
@@ -161,6 +163,8 @@ func resolveAllSymbols(handle uintptr) error {
 		{&ulCreateViewWithURL, "ul_create_view_with_url"},
 		{&ulViewGetSurfaceWidth, "ul_view_get_surface_width"},
 		{&ulViewGetSurfaceHeight, "ul_view_get_surface_height"},
+		{&ulSupportsBinarySend, "ul_supports_binary_send"},
+		{&ulViewSendBinary, "ul_view_send_binary"},
 	} {
 		sym, err := getSymbolAddr(handle, reg.name)
 		if err != nil {

@@ -5,10 +5,12 @@ package ultralightui
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"unsafe"
@@ -115,6 +117,12 @@ type UltralightUI struct {
 	// OnMessage is called when the page sends a message via go.send(msg).
 	// msg is a string or JSON string. Use ParseMessage to get structured data.
 	OnMessage func(msg string)
+
+	// BlockInput, cuando es true, hace que forwardInput trate el cursor como si
+	// estuviese fuera de los bounds. Sirve para evitar que una vista oculta por
+	// otra encima reciba clicks o movimiento. No afecta el teclado si la vista
+	// no tiene foco.
+	BlockInput bool
 
 	closed bool
 }
@@ -386,6 +394,13 @@ func (ui *UltralightUI) forwardInput() {
 	mx -= GlobalCursorOffsetX
 	my -= GlobalCursorOffsetY
 	inBounds := ui.inBounds(mx, my)
+	// Si la vista esta ocluida por otra encima, se comporta como si el cursor
+	// estuviera fuera de sus bounds: no recibe clicks, move ni scroll nuevos.
+	// Los press iniciados previamente dentro (leftDown/rightDown) mantienen la
+	// captura hasta que se suelten, preservando el comportamiento de drag.
+	if ui.BlockInput {
+		inBounds = false
+	}
 
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
 		if inBounds {
@@ -851,6 +866,49 @@ func (ui *UltralightUI) Send(data interface{}) error {
 	sb.Write(jsonBytes)
 	sb.WriteString(suffix)
 	evalJS(ui.viewID, sb.String())
+	return nil
+}
+
+// SupportsBinarySend retorna true si el bridge nativo tiene los simbolos JSC
+// necesarios para SendBinary. Si false, el caller debe usar Send con base64.
+func SupportsBinarySend() bool {
+	return ulSupportsBinarySend != nil && ulSupportsBinarySend() != 0
+}
+
+// SendBinary envia un mensaje a window.go.receive con un objeto JS construido
+// zero-copy: las props no-binarias vienen del map serializado a JSON; binData
+// se monta como Uint8Array bajo la propiedad binKey. Bypassa el path de
+// ulViewEvaluateScript (que tendria que recibir base64 + JSON.parse).
+//
+// El objeto recibido en JS tiene la forma {...props, [binKey]: Uint8Array}.
+// Ideal para pasar PNG/JPEG/raw pixels sin overhead de base64.
+//
+// Si el bridge no soporta el path binario (SupportsBinarySend() == false),
+// retorna error sin enviar nada — el caller deberia hacer fallback a Send.
+func (ui *UltralightUI) SendBinary(props map[string]interface{}, binKey string, binData []byte) error {
+	if ui.closed {
+		return ErrClosed
+	}
+	if !SupportsBinarySend() {
+		return errors.New("ultralightui: bridge does not support binary send (JSC API missing)")
+	}
+	if binKey == "" {
+		return errors.New("ultralightui: binKey is empty")
+	}
+	if len(binData) == 0 {
+		return errors.New("ultralightui: binData is empty")
+	}
+	jsonBytes, err := json.Marshal(props)
+	if err != nil {
+		return fmt.Errorf("SendBinary: marshal props: %w", err)
+	}
+	// El C-side hace strdup + memcpy de los buffers, asi que nuestros []byte
+	// pueden liberarse al retornar.
+	dataPtr := uintptr(unsafe.Pointer(&binData[0]))
+	ulViewSendBinary(ui.viewID, string(jsonBytes), binKey, dataPtr, int32(len(binData)))
+	// Mantener vivo binData hasta despues de la llamada (el GC podria moverlo
+	// entre la conversion a uintptr y el procesamiento C).
+	runtime.KeepAlive(binData)
 	return nil
 }
 
