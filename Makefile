@@ -12,7 +12,7 @@ else
   UNAME_S := $(shell uname -s)
   ifeq ($(UNAME_S),Darwin)
     BRIDGE_OUT = libul_bridge.dylib
-    BRIDGE_CMD = gcc -shared -fPIC -o $(BRIDGE_OUT) $(BRIDGE_SRC) $(CFLAGS) -lpthread -ldl
+    BRIDGE_CMD = gcc -shared -fPIC -arch arm64 -arch x86_64 -o $(BRIDGE_OUT) $(BRIDGE_SRC) $(CFLAGS) -lpthread -ldl
   else
     BRIDGE_OUT = libul_bridge.so
     BRIDGE_CMD = gcc -shared -fPIC -o $(BRIDGE_OUT) $(BRIDGE_SRC) $(CFLAGS) -lpthread -ldl
@@ -32,7 +32,7 @@ bridge-linux:
 	gcc -shared -fPIC -o libul_bridge.so $(BRIDGE_SRC) $(CFLAGS) -lpthread -ldl
 
 bridge-macos:
-	gcc -shared -fPIC -o libul_bridge.dylib $(BRIDGE_SRC) $(CFLAGS) -lpthread -ldl
+	gcc -shared -fPIC -arch arm64 -arch x86_64 -o libul_bridge.dylib $(BRIDGE_SRC) $(CFLAGS) -lpthread -ldl
 
 test:
 	go test -v ./...
